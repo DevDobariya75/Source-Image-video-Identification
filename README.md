@@ -7,6 +7,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![OpenCV](https://img.shields.io/badge/OpenCV-4.x-5C3EE8?logo=opencv&logoColor=white)
 ![NumPy](https://img.shields.io/badge/NumPy-1.21%2B-013243?logo=numpy&logoColor=white)
+![Formats](https://img.shields.io/badge/formats-PNG%20%7C%20JPEG%20%7C%20MP4-2EA44F)
 ![Status](https://img.shields.io/badge/status-in%20development-orange)
 
 </div>
@@ -29,14 +30,27 @@ guide. You can study, run and compare the techniques independently.
 
 | # | Technique | Approach | Status | Guide |
 |---|-----------|----------|--------|-------|
-| 1 | **LSB Steganography** | Hides a device ID (IMEI) in the least significant bits of the pixels, with redundancy and majority voting to survive cropping | ✅ Implemented | [LSB/LSBGuide.md](LSB/LSBGuide.md) |
+| 1 | **LSB Steganography** | Hides a device ID (IMEI) in least significant bits, with redundancy and majority voting. Works on **images (PNG/BMP/TIFF/PPM), JPEG and MP4 video** | ✅ Implemented | [LSB/LSBGuide.md](LSB/LSBGuide.md) |
 | … | *More techniques coming* | | 🚧 Planned | |
 
-Each technique has different strengths. Compare them before choosing one:
+### LSB modes
 
-| Technique | Survives crop | Survives JPEG / resize | Invisible | Needs embedding |
+The LSB technique picks a mode automatically from the **output file name**
+when embedding, and from the **file contents** when extracting:
+
+| Mode | Output | Where the bits go | File size |
+|------|--------|-------------------|-----------|
+| **Pixel** | `.png` `.bmp` `.tif` `.tiff` `.ppm` | Pixel LSBs (3 bits per pixel) | Large (lossless) |
+| **JPEG** | `.jpg` `.jpeg` | LSBs of the JPEG's DCT coefficients, edited without re-compression | Same as the original JPEG |
+| **Video** | `.mp4` | Brightness LSB of every frame, saved as lossless H.264 | 10–20× larger than the original |
+
+Each technique and mode has different strengths. Compare them before choosing:
+
+| Technique / mode | Survives byte-for-byte transfer (USB, WhatsApp *document*) | Survives crop | Survives re-compression / resize (WhatsApp *photo/video*) | Invisible |
 |-----------|:---:|:---:|:---:|:---:|
-| LSB Steganography | ✅ | ❌ | ✅ | ✅ |
+| LSB pixel mode | ✅ | ✅ | ❌ | ✅ |
+| LSB JPEG mode | ✅ (tested via WhatsApp) | ❌ | ❌ | ✅ |
+| LSB video mode | ✅ | ✅ (if saved losslessly) | ❌ | ✅ |
 
 ---
 
@@ -58,9 +72,22 @@ pip install -r requirements.txt
 **Example with LSB:**
 
 ```bash
+# Image -> PNG (pixel mode)
 python embed_imei.py   --image photo.jpg --payload "356938035643809" --output watermarked.png
 python extract_imei.py --image watermarked.png --payload-length 15
+
+# JPEG -> JPEG (JPEG mode)
+python embed_imei.py   --image photo.jpeg --payload "356938035643809" --output watermarked.jpeg
+python extract_imei.py --image watermarked.jpeg --payload-length 15
+
+# MP4 -> MP4 (video mode)
+python embed_imei.py   --image clip.mp4 --payload "356938035643809" --output watermarked.mp4
+python extract_imei.py --image watermarked.mp4 --payload-length 15
 ```
+
+> 📤 To share a watermarked file, send it as a **file** (USB, WhatsApp
+> *Document*, e-mail attachment, cloud drive). Sending it as a normal
+> photo or video re-compresses it and erases the watermark.
 
 ---
 
@@ -71,10 +98,12 @@ MiniProject/
 ├── README.md                 ← you are here (project overview)
 │
 └── LSB/                      ← Technique 1: LSB steganography
-    ├── embed_imei.py
-    ├── extract_imei.py
-    ├── run_test.sh
-    ├── requirements.txt
+    ├── embed_imei.py         ← embed (picks pixel / JPEG / video mode)
+    ├── extract_imei.py       ← extract (detects the mode automatically)
+    ├── jpeg_dct.py           ← JPEG mode: DCT-coefficient LSB
+    ├── video_lsb.py          ← video mode: lossless MP4 frame LSB
+    ├── run_test.sh           ← automated tests for all three modes
+    ├── requirements.txt      ← opencv-python, numpy, jpeglib, av
     └── LSBGuide.md           ← full explanation, formats, tests, limits
 ```
 

@@ -1,2 +1,4 @@
 opencv-python>=4.5
 numpy>=1.21
+jpeglib>=1.0
+av>=12.0

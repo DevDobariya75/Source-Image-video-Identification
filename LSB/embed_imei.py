@@ -16,6 +16,17 @@ local edits.
 Usage
 -----
     python embed_imei.py --image input.jpg --payload "123456789012345" --output watermarked.png
+    python embed_imei.py --image input.jpg --payload "123456789012345" --output watermarked.jpg
+
+An output ending in .jpg/.jpeg switches to JPEG mode (see jpeg_dct.py): the
+bits go into the JPEG's DCT coefficients instead of pixels, so the result
+stays a JPEG and survives byte-for-byte transfers (USB, WhatsApp document
+mode, e-mail). Any other extension uses the pixel-LSB scheme below.
+
+An .mp4 output switches to video mode (see video_lsb.py): the same tiled
+LSB scheme is written into every frame, saved as a lossless H.264 MP4:
+
+    python embed_imei.py --image clip.mp4 --payload "123456789012345" --output watermarked.mp4
 
 How the payload is laid out
 ---------------------------
@@ -38,7 +49,8 @@ Limitations (important for forensic use)
 ----------------------------------------
 * LSB watermarks are FRAGILE against lossy re-compression (JPEG/WebP),
   resizing, rotation, and filtering: those operations rewrite the LSBs.
-  Always save the watermarked output as a lossless format (PNG/BMP/TIFF).
+  In pixel mode, save the output as a lossless format (PNG/BMP/TIFF); for a
+  JPEG output, JPEG mode is used, which is equally fragile to re-encoding.
 * LSB embedding is NOT secret or tamper-proof: anyone who knows the scheme
   can read or overwrite the bits. Use it for provenance *hints*, not proof.
 """
@@ -50,6 +62,9 @@ import sys
 
 import cv2
 import numpy as np
+
+import jpeg_dct
+import video_lsb
 
 # ---------------------------------------------------------------------------
 # Format constants. These MUST match the ones in extract_imei.py, otherwise
@@ -119,7 +134,8 @@ def build_tile(payload: str) -> np.ndarray:
     return padded.reshape(th, tw, BITS_PER_PIXEL)
 
 
-def embed(image_path: str, payload: str, output_path: str) -> None:
+def embed(image_path: str, payload: str, output_path: str,
+          quality: int = 95) -> None:
     if not payload.isascii():
         sys.exit("[!] Payload must be ASCII text.")
     if not (payload.isdigit() and len(payload) == 15):
@@ -128,10 +144,18 @@ def embed(image_path: str, payload: str, output_path: str) -> None:
         sys.exit(f"[!] Payload must not contain the delimiter {DELIMITER!r}.")
 
     ext = os.path.splitext(output_path)[1].lower()
+    if ext in video_lsb.VIDEO_EXTENSIONS:
+        video_lsb.embed(image_path, payload, output_path)
+        return
+    if video_lsb.is_video_file(image_path):
+        sys.exit("[!] Input is a video: use an .mp4 output name.")
+    if ext in jpeg_dct.JPEG_EXTENSIONS:
+        jpeg_dct.embed(image_path, payload, output_path, quality)
+        return
     if ext not in LOSSLESS_EXTENSIONS:
         sys.exit(
             f"[!] Output format {ext!r} is lossy or unsupported. "
-            "Use .png/.bmp/.tif - lossy compression destroys LSBs."
+            "Use .png/.bmp/.tif (pixel mode), .jpg (JPEG mode) or .mp4 (video)."
         )
 
     # IMREAD_COLOR always gives an (H, W, 3) uint8 BGR array. Grayscale input
@@ -207,14 +231,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Embed an IMEI into an image with spatially distributed, "
                     "redundant LSB steganography (crop-resilient).")
-    parser.add_argument("--image", required=True, help="Cover image path")
+    parser.add_argument("--image", required=True,
+                        help="Cover image or video (.mp4) path")
     parser.add_argument("--payload", required=True,
                         help="Payload text, e.g. a 15-digit IMEI")
     parser.add_argument("--output", required=True,
-                        help="Output path (must be lossless, e.g. .png)")
+                        help="Output path: .png/.bmp/.tif (pixel mode), "
+                             ".jpg/.jpeg (JPEG mode) or .mp4 (video mode)")
+    parser.add_argument("--quality", type=int, default=95,
+                        help="JPEG mode only: quality used when the cover is "
+                             "not already a JPEG (default 95). A JPEG cover "
+                             "keeps its own quality.")
     args = parser.parse_args()
+    if not 1 <= args.quality <= 100:
+        sys.exit("[!] --quality must be between 1 and 100.")
 
-    embed(args.image, args.payload, args.output)
+    embed(args.image, args.payload, args.output, args.quality)
     return 0
 
 

@@ -68,5 +68,51 @@ run_extract "5c. Extract from 97x61 crop + 30% LSB noise (voting)"   "$WORK/crop
 "$PY" -c "import cv2; i=cv2.imread('$WORK/cropped_noisy.png'); cv2.imwrite('$WORK/single_tile_noisy.png', i[:8, :8])"
 run_extract "5d. Control: single 8x8 copy + 30% noise (no redundancy)" "$WORK/single_tile_noisy.png" fail
 
+# ---------------------------------------------------------------------------
+# JPEG mode (DCT coefficients): output stays a JPEG.
+# ---------------------------------------------------------------------------
+echo; echo "=== 6. JPEG mode: embed into a JPEG cover, keep it a JPEG ==="
+"$PY" -c "import cv2; cv2.imwrite('$WORK/input.jpg', cv2.imread('$WORK/input.png'), [cv2.IMWRITE_JPEG_QUALITY, 85])"
+"$PY" embed_imei.py --image "$WORK/input.jpg" --payload "$IMEI" --output "$WORK/watermarked.jpg"
+
+# A byte-for-byte copy is what USB transfer / WhatsApp document mode does.
+cp "$WORK/watermarked.jpg" "$WORK/transferred.jpg"
+run_extract "6a. JPEG after byte-for-byte transfer" "$WORK/transferred.jpg" pass
+
+# Re-encoding (WhatsApp photo mode, editing) is expected to destroy the mark.
+"$PY" -c "import cv2; cv2.imwrite('$WORK/recompressed.jpg', cv2.imread('$WORK/watermarked.jpg'), [cv2.IMWRITE_JPEG_QUALITY, 80])"
+run_extract "6b. Control: JPEG re-compressed at quality 80" "$WORK/recompressed.jpg" fail
+
+# ---------------------------------------------------------------------------
+# Video mode: lossless H.264 MP4, LSB in the brightness (Y) plane.
+# ---------------------------------------------------------------------------
+echo; echo "=== 7. Video mode: generate a 2 s clip, embed, copy, extract ==="
+"$PY" - <<'PYEOF'
+import av, numpy as np
+rng = np.random.default_rng(5)
+out = av.open("test_out/input.mp4", "w")
+s = out.add_stream("libx264", rate=25)
+s.width, s.height, s.pix_fmt = 320, 240, "yuv420p"
+for _ in range(50):
+    out.mux(s.encode(av.VideoFrame.from_ndarray(
+        rng.integers(0, 256, (360, 320), dtype=np.uint8), format="yuv420p")))
+out.mux(s.encode()); out.close()
+PYEOF
+"$PY" embed_imei.py --image "$WORK/input.mp4" --payload "$IMEI" --output "$WORK/watermarked.mp4"
+cp "$WORK/watermarked.mp4" "$WORK/transferred.mp4"
+run_extract "7a. Video after byte-for-byte transfer" "$WORK/transferred.mp4" pass
+
+"$PY" - <<'PYEOF'
+import av
+i = av.open("test_out/watermarked.mp4"); v = i.streams.video[0]
+o = av.open("test_out/recompressed.mp4", "w")
+s = o.add_stream("libx264", rate=25)
+s.width, s.height, s.pix_fmt = 320, 240, "yuv420p"; s.options = {"crf": "23"}
+for f in i.decode(v):
+    o.mux(s.encode(av.VideoFrame.from_ndarray(f.to_ndarray(format="yuv420p"), format="yuv420p")))
+o.mux(s.encode()); o.close()
+PYEOF
+run_extract "7b. Control: video re-encoded lossy (CRF 23)" "$WORK/recompressed.mp4" fail
+
 echo
 if [ "$FAILED" = 0 ]; then echo "ALL TESTS PASSED"; else echo "SOME TESTS FAILED"; exit 1; fi

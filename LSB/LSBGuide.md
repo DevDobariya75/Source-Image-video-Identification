@@ -1,9 +1,10 @@
 # LSB Guide
 
 A practical guide to the LSB watermark in this folder. It explains what the
-technique is and which file formats it supports. It then walks through
-testing it step by step, attacking it with crops, resizes and other edits,
-and checking for yourself why it does **not** survive in the real world.
+technique is and which file formats it supports: **images, JPEG and MP4
+video**. It then walks through testing it step by step, attacking it with
+crops, resizes and other edits, and checking for yourself which real-world
+sharing paths it survives.
 
 - [1. What is LSB steganography?](#1-what-is-lsb-steganography)
 - [2. How this project uses it](#2-how-this-project-uses-it)
@@ -13,6 +14,10 @@ and checking for yourself why it does **not** survive in the real world.
 - [6. Robustness tests: crop, resize and more](#6-robustness-tests-crop-resize-and-more)
 - [7. Proving it does not survive the real world](#7-proving-it-does-not-survive-the-real-world)
 - [8. Results summary](#8-results-summary)
+- [9. JPEG mode and video mode tests](#9-jpeg-mode-and-video-mode-tests)
+
+> Sections 5–8 test **pixel mode** (PNG output). Section 9 covers the
+> **JPEG** and **MP4** modes.
 
 ---
 
@@ -71,6 +76,19 @@ single crop removes it. This project adds three things:
 `--payload-length` must match the length that was embedded, because it
 determines the tile size (15 → 8×8).
 
+### Three modes
+
+The same idea (frame + delimiter, redundancy, majority vote) is applied in
+three ways, chosen by the **output extension** when embedding. When
+extracting, the mode is detected from the **file contents**, so the name
+doesn't matter:
+
+| Mode | Output | Where the bits go | Code |
+|---|---|---|---|
+| **Pixel** | `.png` `.bmp` `.tif` `.tiff` `.ppm` | Pixel LSBs, 3 bits per pixel, 8×8 tile | `embed_imei.py`, `extract_imei.py` |
+| **JPEG** | `.jpg` `.jpeg` | LSBs of 16 low-frequency DCT coefficients per 8×8 block | `jpeg_dct.py` |
+| **Video** | `.mp4` | Brightness (Y) LSB of every frame, 13×13 tile, lossless H.264 | `video_lsb.py` |
+
 ---
 
 ## 3. Supported formats
@@ -92,9 +110,76 @@ The output **must be lossless**, or the hidden bits are destroyed on save.
 | `.bmp` | ✅ | Uncompressed, large files |
 | `.tif` / `.tiff` | ✅ | |
 | `.ppm` | ✅ | Uncompressed |
-| `.jpg` / `.jpeg` | ❌ refused | Lossy: the script exits with an error |
+| `.jpg` / `.jpeg` | ✅ JPEG mode | Bits go into DCT coefficients, see below |
 | `.webp` | ❌ refused | OpenCV saves lossy WebP by default |
 | `.pgm` | ❌ refused | Grayscale only, cannot store 3 channels |
+| `.mp4` (video) | ✅ video mode | Lossless H.264, see below |
+
+### JPEG mode (`.jpg` / `.jpeg` output)
+
+Writing pixel LSBs and then saving as JPEG destroys them, because JPEG
+compression rounds them away. So when the output name ends in `.jpg` or
+`.jpeg`, `embed_imei.py` switches to **JPEG mode** (`jpeg_dct.py`):
+
+- It edits the JPEG's quantized **DCT coefficients** directly (16
+  low-frequency coefficients per 8×8 block of the brightness channel, only
+  those with |value| ≥ 2), changing the last bit of each by at most 1.
+- A JPEG cover is edited in place with **no re-compression**. Any other
+  cover is compressed once at `--quality` (default 95).
+- Each bit is stored hundreds of times and recovered by majority vote, as
+  in pixel mode.
+- `extract_imei.py` detects a JPEG from its file header (not its name) and
+  uses JPEG mode automatically.
+
+```bash
+python embed_imei.py --image photo.jpg --payload "356938035643809" --output watermarked.jpg
+python extract_imei.py --image watermarked.jpg --payload-length 15
+```
+
+| What happens to the file | Watermark survives? |
+|---|---|
+| USB / cable copy | ✅ (file unchanged) |
+| WhatsApp **document** mode, e-mail attachment, Google Drive | ✅ (file unchanged) |
+| WhatsApp **photo** mode, Instagram/Facebook upload | ❌ re-compressed |
+| Opened in an editor and saved, screenshot, resize | ❌ re-encoded |
+| Crop | ❌ (only an 8-pixel-aligned lossless crop, e.g. `jpegtran -crop`, keeps it) |
+
+Very flat images (e.g. a single solid colour) have too few non-zero
+coefficients. The script refuses them with an error.
+
+### Video mode (`.mp4` output)
+
+Normal MP4 compression (H.264) is lossy like JPEG and wipes pixel LSBs
+(tests show the bits come out as random noise). So when the output name ends
+in `.mp4`, `embed_imei.py` uses **video mode** (`video_lsb.py`):
+
+- Every frame gets the same tiled LSB pattern in its brightness (Y) plane,
+  1 bit per pixel, in a 13×13 tile for a 15-digit IMEI.
+- The video is saved as **lossless H.264** MP4, so every bit is kept.
+- Audio is copied unchanged, and the phone rotation tag is kept.
+- Extraction votes over every pixel of every frame, so even a short clip
+  gives hundreds of thousands of copies. It also tries every grid
+  alignment, so a crop saved losslessly still decodes.
+
+```bash
+python embed_imei.py --image clip.mp4 --payload "356938035643809" --output watermarked.mp4
+python extract_imei.py --image watermarked.mp4 --payload-length 15
+```
+
+Use `--max-frames N` on extraction to read only the first N frames of a long
+video.
+
+| What happens to the video | Watermark survives? |
+|---|---|
+| USB copy, WhatsApp **document** mode, e-mail, Google Drive | ✅ (file unchanged) |
+| Crop saved losslessly | ✅ |
+| WhatsApp **video** mode, Instagram/YouTube upload | ❌ re-encoded |
+| Edited and exported, screen recording | ❌ re-encoded |
+
+**Downsides:** lossless files are much bigger (a 6 s, 848×480 phone clip
+went from 1.5 MB to 24.8 MB). The "High 4:4:4 Predictive" profile plays in
+VLC and most desktop browsers, but some phone galleries and built-in Windows
+players can't play it.
 
 ### Payload
 
@@ -107,8 +192,11 @@ prints a warning but still embeds. The text must not contain `#END`.
 
 ```bash
 cd LSB
-pip install -r requirements.txt       # opencv-python, numpy
+pip install -r requirements.txt       # opencv-python, numpy, jpeglib, av
 ```
+
+`jpeglib` is only needed for JPEG mode and `av` (PyAV, which bundles its own
+ffmpeg) only for video mode. You don't need a separate ffmpeg install.
 
 All commands below are run **from inside the `LSB/` folder**. They work in
 **PowerShell, Git Bash, Linux and macOS**, except `bash run_test.sh`, which
@@ -131,8 +219,9 @@ bash run_test.sh
 ```
 
 This generates an image and embeds an IMEI. It then crops to 97×61 px at an
-off-grid offset, flips 30% of the LSBs, and extracts. It should end with
-`ALL TESTS PASSED`.
+off-grid offset, flips 30% of the LSBs, and extracts. It also tests JPEG
+mode and video mode: each must survive a byte-for-byte copy and must fail
+after a lossy re-encode. It should end with `ALL TESTS PASSED`.
 
 ### Option B: manual, one step at a time
 
@@ -471,6 +560,10 @@ subsamples colour and quantises DCT coefficients. Decoding never restores
 the exact original values, so the LSBs are lost. Change `100` to `95` or `75`
 in Step 1 and try again. Those fail too.
 
+> This is why pixel mode can't output a JPEG. If you need a JPEG, embed with
+> a `.jpg` output name to use **JPEG mode** (section 9), which writes the
+> bits into the JPEG data itself.
+
 ---
 
 ## 7. Proving it does not survive the real world
@@ -492,7 +585,7 @@ For each test:
 | # | Real-world path | How to test | Expected |
 |---|---|---|---|
 | 1 | **WhatsApp / Telegram (as photo)** | Send to yourself as a normal photo, then save the received image. | ❌ FAIL: re-encoded as JPEG and usually resized |
-| 2 | **WhatsApp / Telegram (as document/file)** | Attach as a *document* / *file*, then download. | ✅ PASS: bytes are sent unchanged |
+| 2 | **WhatsApp / Telegram (as document/file)** | Attach as a *document* / *file*, then download. | ✅ PASS: bytes are sent unchanged (verified for JPEG mode in section 9.1) |
 | 3 | **Instagram / Facebook / X (Twitter)** | Post it, then download the image from the post. | ❌ FAIL: recompressed and resized |
 | 4 | **Email attachment** | Attach the PNG to yourself, then download it. | ✅ usually PASS: attachments are not modified |
 | 5 | **Email inline / "optimise image" option** | Insert the image into the message body. | ❌ often FAIL: clients may resize |
@@ -561,3 +654,125 @@ covers most real-world sharing. For a watermark that survives these, look
 at transform-domain methods (DCT/DWT, spread spectrum) or sensor-noise
 fingerprinting (PRNU), which identifies the camera from its natural noise
 pattern without embedding anything.
+
+---
+
+## 9. JPEG mode and video mode tests
+
+Both modes keep the watermark through any **byte-for-byte** transfer and
+lose it on any **re-encode**. These tests show both cases. Run them from
+inside the `LSB/` folder, with `test_out/` created (section 4).
+
+### 9.1 JPEG mode
+
+**Step 1: embed into a JPEG and keep it a JPEG.** Use your own photo, or
+generate a textured test JPEG:
+
+```shell
+python -c "import cv2, numpy as np; h, w = 600, 800; y, x = np.mgrid[0:h, 0:w]; img = np.dstack([x*255//w, y*255//h, (x+y)*255//(w+h)]).astype(np.uint8); img = cv2.add(img, np.random.default_rng(1).integers(0, 40, img.shape, dtype=np.uint8)); cv2.imwrite('test_out/input.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 85])"
+python embed_imei.py --image test_out/input.jpg --payload "356938035643809" --output test_out/watermarked.jpg
+```
+
+Expected output includes:
+
+```
+[+] Mode              : JPEG (DCT coefficient LSB)
+[+] Cover             : JPEG, coefficients edited in place (no re-compression)
+[+] Copies per bit    : min ..., median ...
+```
+
+> The smooth gradient from section 5 is refused in JPEG mode ("too little
+> detail"). Smooth areas compress to almost all-zero coefficients, which
+> can't carry bits. Real photos have plenty of detail.
+
+**Step 2: extract.**
+
+```shell
+python extract_imei.py --image test_out/watermarked.jpg --payload-length 15
+```
+
+**Expected:** ✅ PASS, confidence 100%.
+
+**Step 3: re-compress it (what WhatsApp photo mode does) and extract again.**
+
+```shell
+python -c "import cv2; cv2.imwrite('test_out/attacked.jpg', cv2.imread('test_out/watermarked.jpg'), [cv2.IMWRITE_JPEG_QUALITY, 80])"
+python extract_imei.py --image test_out/attacked.jpg --payload-length 15
+```
+
+**Expected:** ❌ FAIL, "The file was probably re-compressed".
+
+**Real WhatsApp test (done on this project).** A 1200×1600 phone photo
+(`testimage.jpeg`) was watermarked and sent through WhatsApp as a
+**Document**. The received file had the **same size and the same SHA-256
+hash** as the sent one, and the IMEI was extracted with 100% confidence.
+
+To check a received file yourself, compare hashes:
+
+```shell
+certutil -hashfile received.jpg SHA256      # Windows
+sha256sum received.jpg                     # Linux / Git Bash
+```
+
+### 9.2 Video mode
+
+**Step 1: embed into an MP4.** Use any phone video:
+
+```shell
+python embed_imei.py --image my_clip.mp4 --payload "356938035643809" --output test_out/watermarked.mp4
+```
+
+Expected output includes:
+
+```
+[+] Mode              : Video (Y-plane LSB, lossless H.264 MP4)
+[+] Full copies       : ... per frame, ... total
+[+] Audio             : copied unchanged
+```
+
+**Step 2: extract.** Add `--max-frames 100` to read only the first 100
+frames of a long video.
+
+```shell
+python extract_imei.py --image test_out/watermarked.mp4 --payload-length 15
+```
+
+**Expected:** ✅ PASS, confidence 100%.
+
+**Step 3: re-encode it normally (what WhatsApp video mode does).**
+
+```shell
+python -c "import av; i=av.open('test_out/watermarked.mp4'); v=i.streams.video[0]; o=av.open('test_out/attacked.mp4','w'); s=o.add_stream('libx264', rate=v.average_rate); s.width=v.codec_context.width; s.height=v.codec_context.height; s.pix_fmt='yuv420p'; s.options={'crf':'23'}; [o.mux(s.encode(av.VideoFrame.from_ndarray(f.to_ndarray(format='yuv420p'), format='yuv420p'))) for f in i.decode(v)]; o.mux(s.encode()); o.close()"
+python extract_imei.py --image test_out/attacked.mp4 --payload-length 15
+```
+
+**Expected:** ❌ FAIL, "The video was probably re-encoded".
+
+### 9.3 Results
+
+Measured with this project's scripts:
+
+| Test | JPEG mode | Video mode |
+|---|---|---|
+| Test file | 1200×1600 phone photo | 848×480, 6.3 s phone clip (190 frames, with audio) |
+| Copies of each bit | 508 – 720 | 444,600 tiles |
+| Invisible? | ✅ PSNR 46.4 dB | ✅ PSNR 52.9 dB, max change 1 level |
+| File size | 222 KB → 225 KB | 1.5 MB → 24.8 MB |
+| Byte-for-byte copy / WhatsApp document | ✅ PASS (verified on WhatsApp) | ✅ PASS |
+| Crop | ❌ (only 8-px-aligned lossless crops) | ✅ PASS (300×200 crop saved losslessly) |
+| Re-compression (photo / video mode) | ❌ FAIL | ❌ FAIL |
+| Rotated phone video | n/a | ✅ PASS, rotation tag kept |
+
+### 9.4 Limits of these modes
+
+- **Re-encoding destroys the mark** in both modes: WhatsApp photo/video
+  mode, social media, screenshots, screen recording, or editing and saving.
+- **Lossless MP4 files are big**, often 10–20× the original. WhatsApp
+  documents can be up to 2 GB.
+- **Lossless MP4 playback:** the "High 4:4:4 Predictive" H.264 profile plays
+  in VLC and most desktop browsers, but some phone galleries and built-in
+  Windows players can't play it. The watermark is unaffected either way.
+- **Very flat images** (e.g. a single solid colour) have too few usable
+  JPEG coefficients, and JPEG mode refuses them.
+- Like pixel mode, anyone who knows the scheme can **remove or forge** the
+  mark. Treat the extracted IMEI as a provenance hint, not proof.

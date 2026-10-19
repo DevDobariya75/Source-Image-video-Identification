@@ -6,6 +6,14 @@ extract_imei.py - Extract an IMEI hidden by embed_imei.py, using Majority
 Usage
 -----
     python extract_imei.py --image watermarked.png --payload-length 15
+    python extract_imei.py --image watermarked.jpg --payload-length 15
+
+A JPEG file (detected from its first bytes, not its name) is read in JPEG
+mode: the bits come from its DCT coefficients (see jpeg_dct.py). Any other
+image is read in pixel-LSB mode, described below. An MP4 video is read in
+video mode (see video_lsb.py):
+
+    python extract_imei.py --image watermarked.mp4 --payload-length 15
 
 How extraction works
 --------------------
@@ -39,6 +47,9 @@ import sys
 
 import cv2
 import numpy as np
+
+import jpeg_dct
+import video_lsb
 
 # ---------------------------------------------------------------------------
 # Format constants. These MUST match the ones in embed_imei.py.
@@ -76,7 +87,12 @@ def tile_shape(payload_length: int) -> tuple:
     return side, side
 
 
-def extract(image_path: str, payload_length: int) -> int:
+def extract(image_path: str, payload_length: int, max_frames: int = 0) -> int:
+    if video_lsb.is_video_file(image_path):
+        return video_lsb.extract(image_path, payload_length, max_frames)
+    if jpeg_dct.is_jpeg_file(image_path):
+        return jpeg_dct.extract(image_path, payload_length)
+
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
         sys.exit(f"[!] Could not read image: {image_path}")
@@ -187,14 +203,17 @@ def main() -> int:
         description="Extract an IMEI embedded by embed_imei.py, using "
                     "majority voting across all copies (crop-resilient).")
     parser.add_argument("--image", required=True,
-                        help="Watermarked (possibly cropped) image")
+                        help="Watermarked (possibly cropped) image or .mp4 video")
     parser.add_argument("--payload-length", type=int, default=15,
                         help="Payload length in characters (default 15)")
+    parser.add_argument("--max-frames", type=int, default=0,
+                        help="Video only: read at most this many frames "
+                             "(default 0 = all). Faster on long videos.")
     args = parser.parse_args()
 
     if args.payload_length <= 0:
         sys.exit("[!] --payload-length must be positive.")
-    return extract(args.image, args.payload_length)
+    return extract(args.image, args.payload_length, args.max_frames)
 
 
 if __name__ == "__main__":
