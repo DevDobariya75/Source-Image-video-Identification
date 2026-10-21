@@ -3,3 +3,9 @@ __pycache__/
 backend/data/
 dashboard/node_modules/
 dashboard/dist/
+*.apk
+
+# Local test media (tests generate their own files)
+*.jpg
+*.jpeg
+*.mp4
