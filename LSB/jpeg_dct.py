@@ -104,7 +104,7 @@ def _bits_to_text(bits: np.ndarray) -> str:
     return "".join(chr(b) if b < 128 else "?" for b in data)
 
 
-def _slot_to_bit(frame_bits: int) -> np.ndarray:
+def _slot_to_bit(frame_bits: int, t: int = TILE_BLOCKS) -> np.ndarray:
     """
     (T, T, K) array: which frame bit each slot of a tile carries.
 
@@ -112,30 +112,43 @@ def _slot_to_bit(frame_bits: int) -> np.ndarray:
     bit s mod frame_bits. Consecutive copies of the frame therefore land on
     different frequencies, so a bit never depends on one frequency only.
     """
-    t = TILE_BLOCKS
     k, r, c = np.meshgrid(np.arange(K), np.arange(t), np.arange(t), indexing="ij")
     s = k * t * t + r * t + c                       # shape (K, T, T)
     return (s % frame_bits).transpose(1, 2, 0)      # shape (T, T, K)
 
 
-def _load_dct(image_path: str, quality: int):
+def _bit_index_map(by: int, bx: int, frame_bits: int,
+                   t: int = TILE_BLOCKS) -> np.ndarray:
+    """(blocks_y, blocks_x, K) array of the frame bit each coefficient carries."""
+    m = _slot_to_bit(frame_bits, t)
+    return np.tile(m, (math.ceil(by / t), math.ceil(bx / t), 1))[:by, :bx]
+
+
+def load_dct(image_path: str, quality: int = 95):
     """
     Return (jpeg_object, recompressed_flag).
 
     A JPEG input is opened at the coefficient level, so its quality is kept
     exactly. Any other input (PNG, BMP, ...) is compressed to JPEG once.
+    Raises ValueError if the image can't be read.
     """
+    _require_jpeglib()
     if is_jpeg_file(image_path):
-        return jpeglib.read_dct(image_path), False
+        try:
+            jpeg = jpeglib.read_dct(image_path)
+            _ = jpeg.Y
+        except Exception as e:  # corrupt / unsupported JPEG
+            raise ValueError(f"Could not read JPEG coefficients: {e}") from e
+        return jpeg, False
 
     img = cv2.imread(image_path, cv2.IMREAD_COLOR)
     if img is None:
-        sys.exit(f"[!] Could not read image: {image_path}")
+        raise ValueError(f"Could not read image: {image_path}")
     fd, tmp = tempfile.mkstemp(suffix=".jpg")
     os.close(fd)
     try:
         if not cv2.imwrite(tmp, img, [cv2.IMWRITE_JPEG_QUALITY, quality]):
-            sys.exit("[!] Could not compress the cover image to JPEG.")
+            raise ValueError("Could not compress the cover image to JPEG.")
         jpeg = jpeglib.read_dct(tmp)
         _ = jpeg.Y  # force the coefficients to load before the file is deleted
     finally:
@@ -143,21 +156,23 @@ def _load_dct(image_path: str, quality: int):
     return jpeg, True
 
 
-def embed(image_path: str, payload: str, output_path: str, quality: int = 95) -> None:
-    _require_jpeglib()
-    frame = payload + DELIMITER
-    bits = _text_to_bits(frame)
+def write_bits(jpeg, bits: np.ndarray, t: int = TILE_BLOCKS) -> dict:
+    """
+    Write a frame of bits into the Y-channel DCT coefficient LSBs of `jpeg`
+    (in memory; call jpeg.write_dct() afterwards). The frame is repeated over
+    every T x T block tile. Returns statistics for printing.
+    Raises ValueError if the frame does not fit or the image is too flat.
+    """
     n = bits.size
-    if n > TILE_BLOCKS * TILE_BLOCKS * K:
-        sys.exit(f"[!] Payload too long for JPEG mode (max "
-                 f"{TILE_BLOCKS * TILE_BLOCKS * K // 8 - len(DELIMITER)} chars).")
+    if n > t * t * K:
+        raise ValueError("Payload too long for the tile size.")
 
-    jpeg, recompressed = _load_dct(image_path, quality)
     Y = jpeg.Y                                     # (blocks_y, blocks_x, 8, 8)
     by, bx = Y.shape[:2]
+    index = _bit_index_map(by, bx, n, t)
 
     # Which bit every used coefficient of the image must carry.
-    pattern = bits[_bit_index_map(by, bx, n)].astype(np.int32)
+    pattern = bits[index].astype(np.int32)
 
     coeffs = Y[:, :, ROWS, COLS].astype(np.int32)  # (blocks_y, blocks_x, K)
     mag = np.abs(coeffs)
@@ -165,62 +180,40 @@ def embed(image_path: str, payload: str, output_path: str, quality: int = 95) ->
 
     # Every bit needs at least one usable coefficient, otherwise it can't
     # be recovered.
-    votes = np.bincount(_bit_index_map(by, bx, n)[usable], minlength=n)
+    votes = np.bincount(index[usable], minlength=n)
     if votes.min() == 0:
-        sys.exit("[!] Image has too little detail (too few non-zero DCT "
-                 "coefficients) to hold the payload. Use a larger or more "
-                 "textured image.")
+        raise ValueError("Image has too little detail (too few non-zero DCT "
+                         "coefficients) to hold the payload. Use a larger or "
+                         "more textured image.")
 
     # ------------------------------------------------------------------
     # THE LSB REPLACEMENT, on the coefficient magnitude:
     #     |c| & ~1  clears the LSB, | bit writes the payload bit.
     #     e.g. c = -5 -> |c| = 5 = 101b -> bit 0 -> 100b = 4 -> c = -4
-    # The sign is put back afterwards. |c| stays >= 2.
+    # The sign is put back afterwards. |c| stays >= 2, so the set of usable
+    # coefficients never changes. That is also why a frame can be
+    # overwritten again and again (one chain hop after another).
     # ------------------------------------------------------------------
     new_mag = (mag & ~1) | pattern
     new = np.where(usable, np.sign(coeffs) * new_mag, coeffs)
     changed = int(np.count_nonzero(new != coeffs))
     Y[:, :, ROWS, COLS] = new.astype(Y.dtype)
     jpeg.Y = Y
-    jpeg.write_dct(output_path)
-
-    print(f"[+] Mode              : JPEG (DCT coefficient LSB)")
-    print(f"[+] Embedded payload  : {frame}")
-    print(f"[+] Image size        : {bx * 8} x {by * 8} px ({bx} x {by} blocks)")
-    if recompressed:
-        print(f"[+] Cover             : not a JPEG, compressed once at quality {quality}")
-    else:
-        print(f"[+] Cover             : JPEG, coefficients edited in place "
-              f"(no re-compression)")
-    print(f"[+] Usable coeffs     : {int(usable.sum())} "
-          f"(|c| >= {MIN_MAGNITUDE} in {K} low frequencies)")
-    print(f"[+] Copies per bit    : min {int(votes.min())}, "
-          f"median {int(np.median(votes))}")
-    print(f"[+] Coeffs modified   : {changed} (each by exactly 1)")
-    print(f"[+] Saved             : {output_path}")
-    print("[i] Send it as a FILE (USB, WhatsApp document, e-mail attachment).")
-    print("[i] Re-compressing it (WhatsApp photo mode, editing) destroys the mark.")
+    return {"blocks": (bx, by), "usable": int(usable.sum()),
+            "votes_min": int(votes.min()), "votes_median": int(np.median(votes)),
+            "changed": changed}
 
 
-def _bit_index_map(by: int, bx: int, frame_bits: int) -> np.ndarray:
-    """(blocks_y, blocks_x, K) array of the frame bit each coefficient carries."""
-    t = TILE_BLOCKS
-    m = _slot_to_bit(frame_bits)
-    return np.tile(m, (math.ceil(by / t), math.ceil(bx / t), 1))[:by, :bx]
+def vote_alignments(Y: np.ndarray, n: int, t: int = TILE_BLOCKS):
+    """
+    Majority-vote a frame of n bits out of the Y-channel coefficients, once
+    for every possible grid offset (dy, dx). Yields
+    (dy, dx, bits, confidence, missing, votes_per_bit).
 
-
-def extract(image_path: str, payload_length: int) -> int:
-    _require_jpeglib()
-    try:
-        jpeg = jpeglib.read_dct(image_path)
-        Y = jpeg.Y
-    except Exception as e:  # corrupt / unsupported JPEG
-        sys.exit(f"[!] Could not read JPEG coefficients: {e}")
-
+    The offset is (0, 0) for an untouched file. Trying all T*T offsets also
+    handles a lossless crop on the 8-pixel grid (e.g. jpegtran -crop).
+    """
     by, bx = Y.shape[:2]
-    t = TILE_BLOCKS
-    n = (payload_length + len(DELIMITER)) * 8
-
     coeffs = Y[:, :, ROWS, COLS].astype(np.int32)
     mag = np.abs(coeffs)
     usable = (mag >= MIN_MAGNITUDE).astype(np.int64)
@@ -237,11 +230,8 @@ def extract(image_path: str, payload_length: int) -> int:
     ones = ones_p.reshape(shape5).sum(axis=(0, 2))    # (T, T, K)
     total = total_p.reshape(shape5).sum(axis=(0, 2))
 
-    slot_bit = _slot_to_bit(n).reshape(-1)
+    slot_bit = _slot_to_bit(n, t).reshape(-1)
 
-    # The grid offset is (0, 0) for an untouched file. Trying all T*T offsets
-    # also handles a lossless crop on the 8-pixel grid (e.g. jpegtran -crop).
-    candidates = []
     for dy in range(t):
         for dx in range(t):
             o = np.roll(ones, (-dy, -dx), axis=(0, 1)).reshape(-1)
@@ -252,13 +242,60 @@ def extract(image_path: str, payload_length: int) -> int:
             bits = (2 * b1 > bn).astype(np.uint8)
             with np.errstate(invalid="ignore", divide="ignore"):
                 margin = np.where(bn > 0, np.abs(2.0 * b1 / bn - 1.0), 0.0)
-            confidence = float(margin.mean())
-            missing = int(np.count_nonzero(bn == 0))
+            yield (dy, dx, bits, float(margin.mean()),
+                   int(np.count_nonzero(bn == 0)), bn)
 
-            text = _bits_to_text(bits)
-            payload, tail = text[:payload_length], text[payload_length:]
-            valid = tail == DELIMITER and payload.isprintable() and missing == 0
-            candidates.append((valid, confidence, payload, dy, dx, missing, bn))
+
+def embed(image_path: str, payload: str, output_path: str, quality: int = 95) -> None:
+    _require_jpeglib()
+    frame = payload + DELIMITER
+    bits = _text_to_bits(frame)
+    if bits.size > TILE_BLOCKS * TILE_BLOCKS * K:
+        sys.exit(f"[!] Payload too long for JPEG mode (max "
+                 f"{TILE_BLOCKS * TILE_BLOCKS * K // 8 - len(DELIMITER)} chars).")
+
+    try:
+        jpeg, recompressed = load_dct(image_path, quality)
+        stats = write_bits(jpeg, bits)
+    except ValueError as e:
+        sys.exit(f"[!] {e}")
+    jpeg.write_dct(output_path)
+    bx, by = stats["blocks"]
+
+    print(f"[+] Mode              : JPEG (DCT coefficient LSB)")
+    print(f"[+] Embedded payload  : {frame}")
+    print(f"[+] Image size        : {bx * 8} x {by * 8} px ({bx} x {by} blocks)")
+    if recompressed:
+        print(f"[+] Cover             : not a JPEG, compressed once at quality {quality}")
+    else:
+        print(f"[+] Cover             : JPEG, coefficients edited in place "
+              f"(no re-compression)")
+    print(f"[+] Usable coeffs     : {stats['usable']} "
+          f"(|c| >= {MIN_MAGNITUDE} in {K} low frequencies)")
+    print(f"[+] Copies per bit    : min {stats['votes_min']}, "
+          f"median {stats['votes_median']}")
+    print(f"[+] Coeffs modified   : {stats['changed']} (each by exactly 1)")
+    print(f"[+] Saved             : {output_path}")
+    print("[i] Send it as a FILE (USB, WhatsApp document, e-mail attachment).")
+    print("[i] Re-compressing it (WhatsApp photo mode, editing) destroys the mark.")
+
+
+def extract(image_path: str, payload_length: int) -> int:
+    _require_jpeglib()
+    try:
+        Y = load_dct(image_path)[0].Y
+    except ValueError as e:
+        sys.exit(f"[!] {e}")
+
+    by, bx = Y.shape[:2]
+    n = (payload_length + len(DELIMITER)) * 8
+
+    candidates = []
+    for dy, dx, bits, confidence, missing, bn in vote_alignments(Y, n):
+        text = _bits_to_text(bits)
+        payload, tail = text[:payload_length], text[payload_length:]
+        valid = tail == DELIMITER and payload.isprintable() and missing == 0
+        candidates.append((valid, confidence, payload, dy, dx, missing, bn))
 
     candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
     valid, confidence, payload, dy, dx, missing, bn = candidates[0]

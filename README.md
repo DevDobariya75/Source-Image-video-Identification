@@ -89,6 +89,93 @@ python extract_imei.py --image watermarked.mp4 --payload-length 15
 > *Document*, e-mail attachment, cloud drive). Sending it as a normal
 > photo or video re-compresses it and erases the watermark.
 
+### 🔗 Forwarding chain (photos and videos)
+
+`chain_imei.py` records **every device a photo or video passes through**,
+not just the first one. Each device that forwards the file (e.g. over
+Bluetooth) appends a *hop* (device ID, IMEI, time, and role) to a chain
+hidden in the file. Nothing is re-compressed, so a file can make up to 8
+hops without losing quality.
+
+| Media | Where the chain is hidden | Size change |
+|-------|---------------------------|-------------|
+| Photo (JPEG) | LSBs of the JPEG's DCT coefficients, repeated over the photo | about 1% |
+| Video (MP4 / MOV / 3GP) | A small hidden, scrambled box at the end of the file (`mp4_chain.py`). The video is never re-encoded. | +200 bytes |
+
+```bash
+python chain_imei.py append --input photo.jpg    --output photo_A.jpg   --device-id phone-A --imei 356938035643809
+python chain_imei.py append --input photo_A.jpg  --output photo_AB.jpg  --device-id phone-B --imei 490154203237518
+python chain_imei.py append --input photo_AB.jpg --output photo_ABC.jpg --device-id phone-C --imei 352099001761481 --role claim
+python chain_imei.py read   --input photo_ABC.jpg          # add --json for machine-readable output
+#  -> Path: 356938035643809 -> 490154203237518 -> 352099001761481
+
+python chain_imei.py append --input clip.mp4 --output clip_A.mp4 --device-id phone-A   # videos: same commands
+```
+
+> Why videos don't use pixel LSBs: a phone video is lossy H.264/H.265, so
+> pixel LSBs only survive a *lossless* re-encode (the `video_lsb.py` mode).
+> That makes files 10–20× larger, and phones can't do it. Storing the chain
+> in the container keeps the video byte-for-byte intact.
+
+- **Image ID**: calculated from the original file's content (JPEG: the DC
+  and chroma coefficients; video: the `moov` index), which stamping never
+  changes. All copies of the same original get the same ID, so several
+  copies can be merged into a forwarding tree.
+- **`send` / `claim`**: a device adds itself when it forwards the photo
+  (`send`). The final receiver adds itself with `claim`.
+- If a device is already the last hop (e.g. it sends the same photo to two
+  people), it is not added again.
+- Format: a fixed 176-byte frame with a CRC-32 (see `chain_payload.py`),
+  tiled every 128×128 px and recovered by majority vote.
+
+### 🌐 Backend API (forwarding tree)
+
+`backend/` is a FastAPI server that decodes uploaded photos and videos and
+merges every copy of the same original (same Image ID) into a **forwarding tree**.
+
+```bash
+cd backend
+pip install -r requirements.txt
+uvicorn main:app --reload          # http://127.0.0.1:8000/docs to try it
+python test_api.py                 # automated API tests (temporary database)
+```
+
+| Endpoint | What it does |
+|----------|--------------|
+| `POST /api/upload` | Upload a JPEG photo or MP4/MOV/3GP video (`file` field, up to 1 GB). Returns its chain and the merged tree. |
+| `GET /api/images` | One row per photo: copies, devices, origin |
+| `GET /api/images/{image_id}/tree` | The tree, nested (`root`) and flat (`nodes` + `edges`) |
+| `GET /api/uploads`, `GET /api/uploads/{id}`, `…/file`, `DELETE` | Uploaded copies |
+| `GET /api/devices`, `GET/PUT /api/devices/{device_id}` | Devices seen, with a label you can set |
+
+Data (SQLite database and uploaded photos) is stored in `backend/data/`, or in
+the folder set by `CHAIN_DATA_DIR`.
+
+### 📊 Dashboard (React)
+
+`dashboard/` is a React app (Vite) on top of the backend:
+
+- **Analyze**: drop one or more photos or videos and see each one's chain
+  (A → B → C, with the time between hops).
+- **Media**: one card per original photo or video. Open a card to see its
+  **forwarding tree**, with every uploaded copy merged in. Click a device for
+  its details.
+- **Devices**: every phone seen. Give each a name, like "Dev's phone", and it
+  shows up with that name in every tree.
+
+```bash
+# terminal 1: backend
+cd backend && uvicorn main:app --reload
+
+# terminal 2: dashboard (needs Node.js 20+)
+cd dashboard
+npm install
+npm run dev                         # http://localhost:5173
+```
+
+In development, the dashboard forwards `/api` calls to `http://127.0.0.1:8000`.
+Set `VITE_BACKEND` to use a different backend address.
+
 ---
 
 ## 📁 Project Structure
@@ -97,12 +184,27 @@ python extract_imei.py --image watermarked.mp4 --payload-length 15
 MiniProject/
 ├── README.md                 ← you are here (project overview)
 │
+├── backend/                  ← FastAPI server for the dashboard
+│   ├── main.py               ← REST endpoints (upload, tree, devices)
+│   ├── tree.py               ← merges copies' chains into one tree
+│   ├── db.py                 ← SQLite storage
+│   └── test_api.py           ← automated API tests
+│
+├── dashboard/                ← React dashboard (Vite)
+│   └── src/
+│       ├── pages/            ← Analyze, Photos, Photo tree, Devices
+│       └── components/       ← drop zone, chain strip, tree view
+│
 └── LSB/                      ← Technique 1: LSB steganography
     ├── embed_imei.py         ← embed (picks pixel / JPEG / video mode)
     ├── extract_imei.py       ← extract (detects the mode automatically)
     ├── jpeg_dct.py           ← JPEG mode: DCT-coefficient LSB
     ├── video_lsb.py          ← video mode: lossless MP4 frame LSB
+    ├── chain_imei.py         ← forwarding chain: append / read device hops
+    ├── chain_payload.py      ← binary format of the chain (CRC-checked)
+    ├── mp4_chain.py          ← chain storage for videos (hidden MP4 box)
     ├── run_test.sh           ← automated tests for all three modes
+    ├── test_chain.py         ← automated tests for the forwarding chain
     ├── requirements.txt      ← opencv-python, numpy, jpeglib, av
     └── LSBGuide.md           ← full explanation, formats, tests, limits
 ```

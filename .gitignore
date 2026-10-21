@@ -1,2 +1,5 @@
 test_out/
 __pycache__/
+backend/data/
+dashboard/node_modules/
+dashboard/dist/
