@@ -176,6 +176,45 @@ npm run dev                         # http://localhost:5173
 In development, the dashboard forwards `/api` calls to `http://127.0.0.1:8000`.
 Set `VITE_BACKEND` to use a different backend address.
 
+### 📱 Android app (ChainStamp)
+
+`android/` is the phone app that adds each phone to the chain before the file
+is forwarded over Bluetooth. It works for **photos and videos**.
+
+| Module | What it is |
+|--------|-----------|
+| `android/core` | Pure-Kotlin chain library: the JPEG reader/writer (baseline **and** progressive) and MP4 box writer. It produces exactly the same chains as the Python code, which `LSB/test_kotlin_compat.py` checks. |
+| `android/app` | The app (Jetpack Compose). |
+
+**Build and install**
+
+1. Install [Android Studio](https://developer.android.com/studio).
+2. *File → Open* → choose the `android/` folder and wait for Gradle sync.
+3. Either connect a phone with USB debugging enabled and press **Run ▶**,
+   or use *Build → Build App Bundle(s) / APK(s) → Build APK(s)* and copy
+   `android/app/build/outputs/apk/debug/app-debug.apk` to each phone.
+
+**Demo with three phones (A → B → C)**
+
+1. On each phone, open ChainStamp once and type its IMEI (dial `*#06#` to see it).
+2. **Phone A:** *Choose a photo or video* → **Stamp & send** → pick *Bluetooth* → phone B.
+3. **Phone B:** open the received file → *Share → ChainStamp* (or open ChainStamp →
+   *Choose a photo or video*). The app shows **A**. Tap **Stamp & send** → Bluetooth → phone C.
+4. **Phone C:** open it the same way. The app shows **A → B**. Tap **Save as received**
+   to add C and save it to `Pictures/ChainStamp` (or `Movies/ChainStamp` for videos).
+5. Upload C's copy to the dashboard to see the chain. Upload copies from other
+   branches to see the tree.
+
+> Device ID = Android's `ANDROID_ID`. Since Android 10, normal apps can't read
+> the IMEI, so it is typed in once and stored on the phone.
+
+**Tests that don't need the Android SDK**
+
+```bash
+cd android && ./gradlew -PcoreOnly :core:test     # Kotlin unit tests
+cd LSB && python test_kotlin_compat.py             # Kotlin and Python produce identical chains
+```
+
 ---
 
 ## 📁 Project Structure
@@ -189,6 +228,10 @@ MiniProject/
 │   ├── tree.py               ← merges copies' chains into one tree
 │   ├── db.py                 ← SQLite storage
 │   └── test_api.py           ← automated API tests
+│
+├── android/                  ← Android app (ChainStamp)
+│   ├── core/                 ← Kotlin chain library (JPEG + MP4), tested on a PC
+│   └── app/                  ← the app (Jetpack Compose)
 │
 ├── dashboard/                ← React dashboard (Vite)
 │   └── src/
@@ -205,6 +248,7 @@ MiniProject/
     ├── mp4_chain.py          ← chain storage for videos (hidden MP4 box)
     ├── run_test.sh           ← automated tests for all three modes
     ├── test_chain.py         ← automated tests for the forwarding chain
+    ├── test_kotlin_compat.py ← checks the Android code against this Python code
     ├── requirements.txt      ← opencv-python, numpy, jpeglib, av
     └── LSBGuide.md           ← full explanation, formats, tests, limits
 ```

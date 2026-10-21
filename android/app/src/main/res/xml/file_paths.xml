@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Stamped files waiting to be sent: cacheDir/out/ -->
+    <cache-path name="out" path="out/" />
+</paths>
