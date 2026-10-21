@@ -1,0 +1,5 @@
+-r ../LSB/requirements.txt
+fastapi>=0.115
+uvicorn>=0.30
+python-multipart>=0.0.9
+httpx>=0.27          # only for test_api.py (FastAPI TestClient)
