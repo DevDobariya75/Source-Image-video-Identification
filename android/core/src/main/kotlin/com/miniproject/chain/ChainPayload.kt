@@ -10,27 +10,27 @@ import java.util.zip.CRC32
  * LSB/chain_payload.py, so a file stamped on a phone is read by the backend
  * and the other way round.
  *
- * Frame (176 bytes, big-endian):
- *   0   2   magic "IC"
- *   2   1   version (1)
- *   3   1   hop count N (0..8)
- *   4   8   image ID
- *   12  160 8 hop slots x 20 bytes: device ID (8), IMEI as integer (7),
- *           Unix time (4), role (1). Slots >= N are zero.
- *   172 4   CRC-32 of bytes 0..171
+ * Frame (2016 bytes, big-endian), the same for photos and videos:
+ *   0    2     magic "IC"
+ *   2    1     version (2)
+ *   3    1     hop count N (0..100)
+ *   4    8     image ID
+ *   12   2000  100 hop slots x 20 bytes: device ID (8), IMEI as integer (7),
+ *              Unix time (4), role (1). Slots >= N are zero.
+ *   2012 4     CRC-32 of bytes 0..2011
  */
 object ChainPayload {
     val MAGIC = byteArrayOf('I'.code.toByte(), 'C'.code.toByte())
-    const val VERSION = 1
-    const val MAX_HOPS = 8
+    const val VERSION = 2
+    const val MAX_HOPS = 100
     const val DEVICE_ID_BYTES = 8
     const val IMEI_BYTES = 7
     const val IMAGE_ID_BYTES = 8
     const val HOP_BYTES = 20
     const val HEADER_BYTES = 12
     const val CRC_BYTES = 4
-    const val FRAME_BYTES = HEADER_BYTES + MAX_HOPS * HOP_BYTES + CRC_BYTES   // 176
-    const val FRAME_BITS = FRAME_BYTES * 8                                   // 1408
+    const val FRAME_BYTES = HEADER_BYTES + MAX_HOPS * HOP_BYTES + CRC_BYTES   // 2016
+    const val FRAME_BITS = FRAME_BYTES * 8                                   // 16128
 
     fun pack(chain: Chain): ByteArray {
         if (chain.hops.size > MAX_HOPS) throw ChainException("Chain is full ($MAX_HOPS hops max).")

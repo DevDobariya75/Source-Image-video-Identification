@@ -1,6 +1,6 @@
 import { useRef, useState } from "react";
 
-/** Drag-and-drop or click to choose one or more photos (JPEG) or videos (MP4/MOV/3GP). */
+/** Drag-and-drop or click to choose one or more photos (PNG, or JPEG) or videos (MP4/MOV/3GP). */
 export default function DropZone({ onFiles, busy }) {
   const input = useRef(null);
   const [over, setOver] = useState(false);
@@ -36,7 +36,7 @@ export default function DropZone({ onFiles, busy }) {
       <input
         ref={input}
         type="file"
-        accept="image/jpeg,video/mp4,video/quicktime,video/3gpp,.jpg,.jpeg,.mp4,.mov,.m4v,.3gp"
+        accept="image/png,image/jpeg,video/mp4,video/quicktime,video/3gpp,.png,.jpg,.jpeg,.mp4,.mov,.m4v,.3gp"
         multiple
         hidden
         onChange={(e) => {
@@ -56,8 +56,8 @@ export default function DropZone({ onFiles, busy }) {
       </svg>
       <p className="dropzone-title">{busy ? "Analyzing…" : "Drop photos or videos here, or click to choose"}</p>
       <p className="muted small">
-        JPEG photos or MP4 / MOV / 3GP videos received over Bluetooth. Several copies of the same
-        file build its tree.
+        Stamped PNG photos or MP4 / MOV / 3GP videos received over Bluetooth or USB. Several
+        copies of the same file build its tree.
       </p>
     </div>
   );

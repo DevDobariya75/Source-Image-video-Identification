@@ -15,6 +15,7 @@ sharing paths it survives.
 - [7. Proving it does not survive the real world](#7-proving-it-does-not-survive-the-real-world)
 - [8. Results summary](#8-results-summary)
 - [9. JPEG mode and video mode tests](#9-jpeg-mode-and-video-mode-tests)
+- [10. Forwarding chain (photos and videos)](#10-forwarding-chain-photos-and-videos)
 
 > Sections 5–8 test **pixel mode** (PNG output). Section 9 covers the
 > **JPEG** and **MP4** modes.
@@ -776,3 +777,132 @@ Measured with this project's scripts:
   JPEG coefficients, and JPEG mode refuses them.
 - Like pixel mode, anyone who knows the scheme can **remove or forge** the
   mark. Treat the extracted IMEI as a provenance hint, not proof.
+
+---
+
+## 10. Forwarding chain (photos and videos)
+
+Sections 1–9 hide **one** IMEI. The forwarding chain (`chain_imei.py`)
+records **every device a file passes through**: each phone that forwards it
+adds a *hop*, and reading the file gives the full path A → B → C. Files are
+assumed to travel **byte for byte** (Bluetooth, USB), never through an app
+that re-compresses them.
+
+> The complete, bit-by-bit description of the format (with worked examples)
+> is in [ChainStorageFormat.md](../ChainStorageFormat.md).
+
+### 10.1 The chain frame
+
+Photos and videos carry the same fixed **2016-byte frame** (`chain_payload.py`),
+so the reader always knows how many bits to look for:
+
+| Bytes | Field |
+|---|---|
+| 0–1 | magic `IC` |
+| 2 | version (`2`) |
+| 3 | hop count (0–100) |
+| 4–11 | Image ID (same for every copy of one original) |
+| 12–2011 | **100 hop slots** × 20 bytes: device ID (8), IMEI (7), Unix time (4), role (1: send, 2: claim). Unused slots are zero. |
+| 2012–2015 | CRC-32 of bytes 0–2011 |
+
+The magic bytes and the CRC-32 make sure that random LSB noise or a wrong
+grid offset is never reported as a chain.
+
+### 10.2 Photos: RGB pixel LSB, repeated over the whole photo
+
+`pixel_chain.py` writes the 16,128 frame bits into the low bits of the
+**R, G and B** values of the pixels. You choose how many bits per pixel:
+
+| Mode | Bits per value | Max change | Tile side | Full copies in 1200×1600 | in 4080×3060 |
+|---|---|---|---|---|---|
+| **3 bits/pixel** (default) | bit 0 of R, G, B | ±1 | ⌈√⌈16128/3⌉⌉ = **74 px** | 336 | 2,255 |
+| **6 bits/pixel** | bits 1 and 0 of R, G, B | ±3 | ⌈√⌈16128/6⌉⌉ = **52 px** | 690 | 4,524 |
+
+**Layout.** Frame bit *i* goes into tile pixel *p = i / bpp* (row *p / side*,
+column *p % side*), slot *j = i % bpp* of that pixel:
+
+```
+3 bits/pixel   slot 0 1 2        -> LSB of  R  G  B
+6 bits/pixel   slot 0 1 | 2 3 | 4 5 -> bit1 bit0 of R | G | B
+```
+
+The spare slots at the end of the tile are 0. Pixel *(y, x)* of the photo
+carries tile pixel *(y % side, x % side)*, so the tile is **repeated across
+the whole photo** and every *side × side* window holds a complete chain.
+
+**Reading.**
+
+1. Every pixel votes: for each tile cell and slot, count how many copies say `1`.
+2. A crop starts somewhere inside a tile, so try every grid offset
+   (74 × 74 = 5,476 or 52 × 52 = 2,704). The 24 bits of magic + version are
+   checked first at all offsets at once; only offsets that match are fully decoded.
+3. Majority vote per bit, then the CRC-32 decides. Both modes are tried, so the
+   reader needs no setting.
+
+**Every hop rewrites the whole chain** in the mode the sender picks, so the
+mode can change from hop to hop. A JPEG (or HEIC, WebP…) is converted to PNG
+**once**, at the first hop; from then on nothing is ever re-compressed.
+
+**Image ID** = first 8 bytes of SHA-256 over the width, height and every
+R/G/B value with its **two lowest bits cleared**. Stamping only touches those
+bits, so every copy of an original, in either mode, gets the same ID.
+
+```bash
+cd LSB
+python chain_imei.py append --input photo.jpg   --output A.png  --device-id phone-A --imei 356938035643809
+python chain_imei.py append --input A.png       --output AB.png --device-id phone-B --imei 490154203237518 --bpp 6
+python chain_imei.py read   --input AB.png
+```
+
+### 10.3 Videos: the complete chain in one MP4 box
+
+Phone videos are lossy H.264/H.265, so pixel LSBs would only survive a
+lossless re-encode (10–20× larger, and phones can't do it). `mp4_chain.py`
+instead appends one `uuid` box at the **end** of the file holding the
+**complete 2016-byte frame** (all 100 hop slots), XOR-scrambled so it isn't
+readable text:
+
+```
+[ftyp][moov][mdat] ... [uuid box, 2,040 B: 16-B ID + scrambled frame]
+```
+
+The video and audio bytes are never touched, chunk offsets stay valid, and
+later hops overwrite the box in place. The Image ID is a hash of the `moov`
+box. A box in the old 8-hop format is renamed to `free` and replaced.
+
+### 10.4 Tests and measured results
+
+```bash
+python test_chain.py            # 72 checks: both photo modes, crops, damage, 100 hops, videos
+python test_kotlin_compat.py    # Android (Kotlin) and Python write identical pixels / bytes
+```
+
+Measured with `chain_imei.py` on real phone photos (photo 1: 1200 × 1600 camera
+JPEG, 222 KB; 12 MP: 4080 × 3060, 3.2 MB):
+
+| Test | 3 bits/pixel | 6 bits/pixel |
+|---|---|---|
+| PSNR after 3 hops / after 100 hops (photo 1) | 51.3 dB / 51.1 dB | 42.9 dB / 44.1 dB |
+| R, G, B values changed | ≈ 48 %, by exactly 1 | ≈ 72 %, by up to 3 |
+| Copies of every bit (photo 1 / 12 MP) | 336 / 2,255 | 690 / 4,524 |
+| Stamped PNG, photo 1 (3 hops / 100 hops) | 1.76 / 2.68 MB | 1.43 / 2.85 MB |
+| Stamped PNG, 12 MP photo | 8.5 MB | 6.9 MB |
+| Stamp / read time, 12 MP photo (Python) | 3.8 s / 0.4 s | 3.1 s / 0.4 s |
+| All 100 hops read back | ✅ 100 % confidence | ✅ 100 % confidence |
+| Random carrier-bit flips survived (5 / 5 trials) | up to 35 % | up to 40 % |
+| Smallest readable crop (any offset) | 74 × 74 px | 52 × 52 px |
+| Resize to 99 %, or save as JPEG (quality 100) | ❌ lost | ❌ lost |
+
+Videos: a 1.47 MB phone clip grew by exactly **2,040 bytes** after three
+hops, and every frame and the audio decode bit-identically.
+
+### 10.5 Limits
+
+- **Resizing, rotating, filtering, screenshots and saving as JPEG** recompute
+  every pixel and erase the chain. Repetition protects against **crops**, not
+  against these. Send stamped photos only as files (USB, Bluetooth).
+- A stamped photo is a **PNG**, several times larger than the camera JPEG, so
+  Bluetooth transfers take longer.
+- A crop smaller than one tile (74×74 or 52×52 px) can't be read.
+- Anyone who knows the format can **read, remove or forge** the chain (CRC-32
+  is not a signature). Treat it as a provenance hint, not proof.

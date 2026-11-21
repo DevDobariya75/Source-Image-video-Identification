@@ -2,8 +2,9 @@
 """
 test_chain.py - End-to-end tests for the forwarding chain (chain_imei.py).
 
-Simulates photos travelling between phones over Bluetooth (a byte-for-byte
-copy) and checks that the chain, and the tree it forms, can be recovered:
+Simulates photos (PNG, RGB pixel LSB, 3 and 6 bits per pixel) and videos
+(MP4 box) travelling between phones over Bluetooth (a byte-for-byte copy)
+and checks that the chain, and the tree it forms, can be recovered:
 
         A                 A sends to B and D, B sends to C,
        / \                C and D "claim" the photo on arrival.
@@ -23,7 +24,7 @@ import numpy as np
 
 import chain_imei as ci
 import chain_payload as cp
-import jpeg_dct
+import pixel_chain
 
 WORK = "test_out/chain"
 IMEI = {"A": "356938035643809", "B": "490154203237518",
@@ -59,7 +60,7 @@ def imeis(res) -> list:
 
 
 def make_cover() -> str:
-    """A 1024x768 textured photo-like JPEG (quality 90)."""
+    """A 1024x768 textured photo-like JPEG (quality 90), like a camera photo."""
     rng = np.random.default_rng(3)
     h, w = 768, 1024
     y, x = np.mgrid[0:h, 0:w]
@@ -112,7 +113,7 @@ def test_video() -> None:
     import mp4_chain
     for faststart in (False, True):
         layout = "moov first (faststart)" if faststart else "moov last (phone default)"
-        print(f"7. Video chain, {layout}")
+        print(f"8. Video chain, {layout}")
         src = make_video(f"clip_{int(faststart)}.mp4", faststart)
         before = decode_video(src)
         check("plain video has no chain", ci.read_chain(src) is None)
@@ -126,7 +127,7 @@ def test_video() -> None:
         check("chain A -> B -> C read back",
               res is not None and res.media == "video"
               and imeis(res) == [IMEI["A"], IMEI["B"], IMEI["C"]])
-        check("file grew by exactly one 200-byte box",
+        check("file grew by exactly one 2040-byte box (complete chain)",
               os.path.getsize(final) - os.path.getsize(src) == mp4_chain.BOX_SIZE)
         check("video and audio decode identically (no re-encoding)",
               decode_video(final) == before)
@@ -143,7 +144,7 @@ def test_video() -> None:
         check("branch A -> D has the same image ID",
               res_d is not None and res_d.chain.image_id == res.chain.image_id)
 
-    print("8. Video edge cases")
+    print("9. Video edge cases")
     # A last box with size 0 means "runs to end of file"; appending must fix it.
     src = path("clip_1.mp4")                    # faststart: mdat is the last box
     with open(src, "rb") as f:
@@ -181,6 +182,29 @@ def test_video() -> None:
         f.write(b"hello world" * 100)
     check("unknown file type: no chain", ci.read_chain(path("not_media.bin")) is None)
 
+    src = path("clip_0.mp4")
+    for i in range(cp.MAX_HOPS):
+        ci.append_hop(src, path("v_full.mp4"), cp.parse_device_id(f"dev{i}"), None)
+        src = path("v_full.mp4")
+    res = ci.read_chain(src)
+    check(f"video: {cp.MAX_HOPS} hops fit in the one box",
+          res is not None and len(res.chain.hops) == cp.MAX_HOPS)
+    check("video: file still grew by one box only",
+          os.path.getsize(src) - os.path.getsize(path("clip_0.mp4")) == mp4_chain.BOX_SIZE)
+
+    # A video stamped with the old 8-hop format (200-byte box): the old box is
+    # turned into a "free" box and a new one is appended.
+    old = path("v_old_format.mp4")
+    shutil.copyfile(path("clip_0.mp4"), old)
+    with open(old, "ab") as f:
+        f.write((200).to_bytes(4, "big") + b"uuid" + mp4_chain.CHAIN_UUID + bytes(176))
+    hop(old, "v_old_format_A.mp4", "A")
+    with open(path("v_old_format_A.mp4"), "rb") as f:
+        types = [b["type"] for b in mp4_chain.top_level_boxes(f)]
+    check("old-format box replaced (renamed to 'free', new box appended)",
+          types[-2:] == [b"free", b"uuid"]
+          and imeis(ci.read_chain(path("v_old_format_A.mp4"))) == [IMEI["A"]])
+
 
 def main() -> int:
     os.makedirs(WORK, exist_ok=True)
@@ -192,7 +216,8 @@ def main() -> int:
     chain.hops.append(cp.make_hop(DEV["B"], None, cp.ROLE_CLAIM, 1700000100))
     frame = cp.pack(chain)
     back = cp.unpack(frame)
-    check(f"frame is {cp.FRAME_BYTES} bytes", len(frame) == cp.FRAME_BYTES)
+    check(f"frame is {cp.FRAME_BYTES} bytes with room for {cp.MAX_HOPS} hops",
+          len(frame) == cp.FRAME_BYTES == 2016 and cp.MAX_HOPS == 100)
     check("pack/unpack round trip", back == chain)
     damaged = bytearray(frame)
     damaged[20] ^= 0x01
@@ -204,89 +229,138 @@ def main() -> int:
     check("ANDROID_ID hex is used as-is",
           cp.parse_device_id("9774d56d682e549c") == bytes.fromhex("9774d56d682e549c"))
     check("IMEI Luhn check", cp.luhn_ok(IMEI["A"]) and not cp.luhn_ok("356938035643808"))
+    check("tile sides: 74 px (3 bits/pixel), 52 px (6 bits/pixel)",
+          pixel_chain.tile_side(3) == 74 and pixel_chain.tile_side(6) == 52)
 
     print("2. Unstamped photo")
     check("no chain in a plain JPEG", ci.read_chain(cover) is None)
+    png_cover = path("cover.png")
+    pixel_chain.save_png(png_cover, pixel_chain.load_rgb(cover))
+    check("no chain in a plain PNG", ci.read_chain(png_cover) is None)
 
-    print("3. Chain A -> B -> C over Bluetooth")
-    hop(cover, "A_out.jpg", "A")
-    at_b = bluetooth(path("A_out.jpg"), "B_in.jpg")
-    hop(at_b, "B_out.jpg", "B")
-    at_c = bluetooth(path("B_out.jpg"), "C_in.jpg")
-    hop(at_c, "C_final.jpg", "C", cp.ROLE_CLAIM)
-    res_c = ci.read_chain(path("C_final.jpg"))
-    check("chain found", res_c is not None)
-    check("order is A, B, C",
-          res_c is not None and imeis(res_c) == [IMEI["A"], IMEI["B"], IMEI["C"]])
-    check("device IDs match",
-          res_c is not None and [h.device_id for h in res_c.chain.hops]
-          == [DEV["A"], DEV["B"], DEV["C"]])
-    check("roles are send, send, claim",
-          res_c is not None and [h.role for h in res_c.chain.hops]
-          == [cp.ROLE_SEND, cp.ROLE_SEND, cp.ROLE_CLAIM])
-    image_id = ci.read_chain(path("A_out.jpg")).chain.image_id
-    check("image ID stays the same along the chain",
-          res_c is not None and res_c.chain.image_id == image_id)
+    original = pixel_chain.load_rgb(cover)
+    for bpp, max_delta in ((3, 1), (6, 3)):
+        m = f"_{bpp}"
+        print(f"3. Chain A -> B -> C over Bluetooth, {bpp} bits/pixel")
+        r = hop(cover, f"A_out{m}.png", "A", bits_per_pixel=bpp)
+        check("JPEG input converted once to PNG", r["converted"])
+        at_b = bluetooth(path(f"A_out{m}.png"), f"B_in{m}.png")
+        hop(at_b, f"B_out{m}.png", "B")                   # keeps the photo's mode
+        at_c = bluetooth(path(f"B_out{m}.png"), f"C_in{m}.png")
+        hop(at_c, f"C_final{m}.png", "C", cp.ROLE_CLAIM)
+        res_c = ci.read_chain(path(f"C_final{m}.png"))
+        check("chain found", res_c is not None)
+        check("order is A, B, C",
+              res_c is not None and imeis(res_c) == [IMEI["A"], IMEI["B"], IMEI["C"]])
+        check("device IDs match",
+              res_c is not None and [h.device_id for h in res_c.chain.hops]
+              == [DEV["A"], DEV["B"], DEV["C"]])
+        check("roles are send, send, claim",
+              res_c is not None and [h.role for h in res_c.chain.hops]
+              == [cp.ROLE_SEND, cp.ROLE_SEND, cp.ROLE_CLAIM])
+        check(f"mode detected: {bpp} bits/pixel",
+              res_c is not None and res_c.bits_per_pixel == bpp)
+        image_id = ci.read_chain(path(f"A_out{m}.png")).chain.image_id
+        check("image ID stays the same along the chain",
+              res_c is not None and res_c.chain.image_id == image_id)
+        out = pixel_chain.load_rgb(path(f"C_final{m}.png"))
+        diff = np.abs(out.astype(int) - original.astype(int))
+        check(f"every R/G/B value changed by at most {max_delta}", int(diff.max()) <= max_delta)
+        check(f"only the lowest {bpp // 3} bit(s) differ",
+              np.array_equal(out >> (bpp // 3), original >> (bpp // 3)))
+        mse = float((diff ** 2).mean())
+        print(f"       PSNR {10 * np.log10(255 ** 2 / mse):.1f} dB")
 
-    jpeg = jpeg_dct.load_dct(cover)[0]
-    out = jpeg_dct.load_dct(path("C_final.jpg"))[0]
-    check("no re-compression (DC coefficients and chroma untouched)",
-          np.array_equal(jpeg.Y[:, :, 0, 0], out.Y[:, :, 0, 0])
-          and np.array_equal(jpeg.Cb, out.Cb) and np.array_equal(jpeg.Cr, out.Cr))
-    diff = np.abs(jpeg.Y.astype(int) - out.Y.astype(int))
-    check("every Y coefficient changed by at most 1", int(diff.max()) <= 1)
+        if bpp == 3:
+            id_3 = image_id
+        else:
+            check("same original gives the same image ID in both modes", image_id == id_3)
+
+    m = "_3"
+    image_id = id_3
+    res_c = ci.read_chain(path(f"C_final{m}.png"))
 
     print("4. Branch: A also sends its copy to D")
-    r = hop(path("A_out.jpg"), "A_out_again.jpg", "A")
+    r = hop(path(f"A_out{m}.png"), "A_out_again.png", "A")
     check("A is not added twice when it sends again", not r["added"])
-    at_d = bluetooth(path("A_out_again.jpg"), "D_in.jpg")
-    hop(at_d, "D_final.jpg", "D", cp.ROLE_CLAIM)
-    res_d = ci.read_chain(path("D_final.jpg"))
+    at_d = bluetooth(path("A_out_again.png"), "D_in.png")
+    hop(at_d, "D_final.png", "D", cp.ROLE_CLAIM)
+    res_d = ci.read_chain(path("D_final.png"))
     check("D's copy reads A -> D",
           res_d is not None and imeis(res_d) == [IMEI["A"], IMEI["D"]])
     check("D's copy has the same image ID as C's (same tree)",
           res_d is not None and res_d.chain.image_id == image_id)
-    hop(cover, "A_fresh.jpg", "A")
+    hop(cover, "A_fresh.png", "A")
     check("stamping the original again gives the same image ID",
-          ci.read_chain(path("A_fresh.jpg")).chain.image_id == image_id)
-    r = hop(path("A_out.jpg"), "A_repeat.jpg", "A", allow_repeat=True)
+          ci.read_chain(path("A_fresh.png")).chain.image_id == image_id)
+    r = hop(path(f"A_out{m}.png"), "A_repeat.png", "A", allow_repeat=True)
     check("allow_repeat adds the same device again", r["added"]
           and len(r["chain"].hops) == 2)
 
-    print("5. Damage")
-    Y = jpeg_dct.load_dct(path("C_final.jpg"))[0].Y
-    res = ci._decode(Y[5:5 + 40, 3:3 + 50])      # 400x320 px crop, off-grid
-    check("survives a 400x320 crop at a tile-misaligned offset",
-          res is not None and imeis(res) == imeis(res_c))
-    rng = np.random.default_rng(9)
-    noisy = Y.copy()
-    flip = (rng.random(noisy.shape) < 0.10) & (np.abs(noisy) >= 2)
-    noisy[flip] = np.sign(noisy[flip]) * (np.abs(noisy[flip]) ^ 1)
-    res = ci._decode(noisy)
-    check("survives 10% of coefficient LSBs flipped (majority vote)",
-          res is not None and imeis(res) == imeis(res_c))
-    img = cv2.imread(path("C_final.jpg"))
-    cv2.imwrite(path("recompressed.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    check("control: re-compression (e.g. WhatsApp photo) destroys the chain",
-          ci.read_chain(path("recompressed.jpg")) is None)
+    print("5. Switching mode between hops")
+    hop(path("C_final_3.png"), "C_to_6.png", "D", bits_per_pixel=6)
+    res = ci.read_chain(path("C_to_6.png"))
+    check("3-bit photo re-stamped in 6-bit mode: whole chain kept",
+          res is not None and res.bits_per_pixel == 6
+          and imeis(res) == [IMEI["A"], IMEI["B"], IMEI["C"], IMEI["D"]])
+    hop(path("C_final_6.png"), "C_to_3.png", "D", bits_per_pixel=3)
+    res = ci.read_chain(path("C_to_3.png"))
+    check("6-bit photo re-stamped in 3-bit mode: whole chain kept",
+          res is not None and res.bits_per_pixel == 3 and len(res.chain.hops) == 4)
 
-    print("6. Limits")
+    print("6. Damage")
+    for bpp in (3, 6):
+        rgb = pixel_chain.load_rgb(path(f"C_final_{bpp}.png"))
+        side = pixel_chain.tile_side(bpp)
+        crop = rgb[37:37 + side + 3, 91:91 + 2 * side]
+        res = pixel_chain.decode(crop)
+        check(f"{bpp} bits/pixel: survives a {crop.shape[1]}x{crop.shape[0]} crop "
+              "at a tile-misaligned offset",
+              res is not None and [h.imei for h in res.chain.hops] == imeis(res_c))
+        check(f"{bpp} bits/pixel: crop smaller than one tile can't be read",
+              pixel_chain.decode(rgb[:side - 1, :side - 1]) is None)
+        rng = np.random.default_rng(9)
+        noisy = rgb ^ (rng.random(rgb.shape) < 0.10).astype(np.uint8)
+        res = pixel_chain.decode(noisy)
+        check(f"{bpp} bits/pixel: survives 10% of LSBs flipped (majority vote)",
+              res is not None and [h.imei for h in res.chain.hops] == imeis(res_c))
+    img = cv2.imread(path("C_final_3.png"))
+    cv2.imwrite(path("recompressed.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+    pixel_chain.save_png(path("recompressed.png"), pixel_chain.load_rgb(path("recompressed.jpg")))
+    check("control: saving as JPEG (e.g. WhatsApp photo) destroys the chain",
+          ci.read_chain(path("recompressed.png")) is None)
+    h, w = img.shape[:2]
+    small = cv2.resize(img, (w * 9 // 10, h * 9 // 10), interpolation=cv2.INTER_AREA)
+    cv2.imwrite(path("resized.png"), small)
+    check("control: resizing to 90% destroys the chain (LSBs are recomputed)",
+          ci.read_chain(path("resized.png")) is None)
+
+    print("7. Limits")
     src = cover
     for i in range(cp.MAX_HOPS):
-        ci.append_hop(src, path("full.jpg"), cp.parse_device_id(f"dev{i}"), None)
-        src = path("full.jpg")
-    check(f"{cp.MAX_HOPS} hops fit",
-          len(ci.read_chain(src).chain.hops) == cp.MAX_HOPS)
+        ci.append_hop(src, path("full.png"), cp.parse_device_id(f"dev{i}"), None,
+                      bits_per_pixel=3 if i % 2 else 6)
+        src = path("full.png")
+    full = ci.read_chain(src)
+    check(f"{cp.MAX_HOPS} hops fit in a photo",
+          full is not None and len(full.chain.hops) == cp.MAX_HOPS)
     try:
-        ci.append_hop(src, path("overfull.jpg"), cp.parse_device_id("dev-x"), None)
-        check("a 9th hop is refused", False)
+        ci.append_hop(src, path("overfull.png"), cp.parse_device_id("dev-x"), None)
+        check(f"hop {cp.MAX_HOPS + 1} is refused", False)
     except cp.ChainError:
-        check("a 9th hop is refused", True)
-    png = path("cover.png")
-    cv2.imwrite(png, cv2.imread(cover))
-    r = ci.append_hop(png, path("from_png.jpg"), DEV["A"], IMEI["A"])
-    check("a non-JPEG input is converted once and stamped",
-          r["recompressed"] and ci.read_chain(path("from_png.jpg")) is not None)
+        check(f"hop {cp.MAX_HOPS + 1} is refused", True)
+    try:
+        ci.append_hop(cover, path("wrong.jpg"), DEV["A"], None)
+        check("a photo can't be saved as .jpg", False)
+    except ValueError:
+        check("a photo can't be saved as .jpg", True)
+    tiny = path("tiny.png")
+    cv2.imwrite(tiny, cv2.imread(cover)[:60, :60])
+    try:
+        ci.append_hop(tiny, path("tiny_out.png"), DEV["A"], None)
+        check("a photo smaller than one tile is refused", False)
+    except ValueError:
+        check("a photo smaller than one tile is refused", True)
 
     test_video()
 

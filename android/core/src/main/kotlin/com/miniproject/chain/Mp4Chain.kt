@@ -6,14 +6,15 @@ import java.security.MessageDigest
 
 /**
  * Chain storage for videos (MP4 / MOV / 3GP). Mirror of LSB/mp4_chain.py:
- * one top-level box `uuid` + CHAIN_UUID + scrambled 176-byte frame, appended
- * at the end of the file and overwritten in place by later hops. The video
- * is never re-encoded.
+ * one top-level box `uuid` + CHAIN_UUID + the complete chain (scrambled
+ * 2016-byte frame, 100 hop slots), appended at the end of the file and
+ * overwritten in place by later hops. The video is never re-encoded. A box
+ * in the old 8-hop format is renamed to "free" and a new one is appended.
  */
 object Mp4Chain {
     private val CHAIN_UUID = hex("6b1f8e3a52c94d07a3e1d9c46f20b8a5")
     private const val BOX_HEADER = 8 + 16
-    const val BOX_SIZE = BOX_HEADER + ChainPayload.FRAME_BYTES      // 200
+    const val BOX_SIZE = BOX_HEADER + ChainPayload.FRAME_BYTES      // 2040
 
     private val KEY: ByteArray = run {
         val out = java.io.ByteArrayOutputStream()
@@ -59,8 +60,10 @@ object Mp4Chain {
         return boxes
     }
 
-    private fun List<Box>.chainBox() =
-        firstOrNull { it.type == "uuid" && it.uuid.contentEquals(CHAIN_UUID) && it.size == BOX_SIZE.toLong() }
+    private fun List<Box>.ourBoxes() = filter { it.type == "uuid" && it.uuid.contentEquals(CHAIN_UUID) }
+
+    /** Our box in the current format (old 200-byte boxes are ignored). */
+    private fun List<Box>.chainBox() = ourBoxes().firstOrNull { it.size == BOX_SIZE.toLong() }
 
     /** Image ID: SHA-256 of the moov box (the video's index, never modified), first 8 bytes. */
     fun contentId(file: File): ByteArray = RandomAccessFile(file, "r").use { f ->
@@ -102,6 +105,10 @@ object Mp4Chain {
                 f.seek(existing.offset)
                 f.write(payload)
                 return
+            }
+            for (old in boxes.ourBoxes()) {          // old-format box: hide it
+                f.seek(old.offset + 4)
+                f.write("free".toByteArray(Charsets.US_ASCII))
             }
             val last = boxes.last()
             if (last.openEnded) {

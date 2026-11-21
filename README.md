@@ -92,41 +92,60 @@ python extract_imei.py --image watermarked.mp4 --payload-length 15
 ### 🔗 Forwarding chain (photos and videos)
 
 `chain_imei.py` records **every device a photo or video passes through**,
-not just the first one. Each device that forwards the file (e.g. over
-Bluetooth) appends a *hop* (device ID, IMEI, time, and role) to a chain
-hidden in the file. Nothing is re-compressed, so a file can make up to 8
-hops without losing quality.
+not just the first one. Each device that forwards the file (over Bluetooth
+or USB) appends a *hop* (device ID, IMEI, time, and role) to a chain hidden
+in the file. The chain has room for **100 hops**.
 
 | Media | Where the chain is hidden | Size change |
 |-------|---------------------------|-------------|
-| Photo (JPEG) | LSBs of the JPEG's DCT coefficients, repeated over the photo | about 1% |
-| Video (MP4 / MOV / 3GP) | A small hidden, scrambled box at the end of the file (`mp4_chain.py`). The video is never re-encoded. | +200 bytes |
+| Photo | **RGB pixel LSBs** (`pixel_chain.py`): 3 or 6 bits per pixel, as a small tile **repeated over the whole photo**. Saved as a lossless **PNG**. | JPEG → PNG (a camera JPEG becomes a few times larger) |
+| Video (MP4 / MOV / 3GP) | The **complete chain** in one small hidden, scrambled box at the end of the file (`mp4_chain.py`). The video is never re-encoded. | +2,040 bytes |
+
+**Photo modes** (chosen with `--bpp`, or in the app):
+
+| Mode | Bits used | Change per R/G/B value | Tile (one full copy of the chain) | Copies in a 12 MP photo |
+|------|-----------|-----------------------:|-----------------------------------|------------------------:|
+| **3 bits/pixel** (default) | bit 0 of R, G, B | ±1 | 74 × 74 px | ≈ 2,255 |
+| **6 bits/pixel** | bits 1 and 0 of R, G, B | ±3 | 52 × 52 px | ≈ 4,524 |
+
+Every 74 × 74 (or 52 × 52) window of the photo holds a full copy of the
+chain, so **any crop at least one tile wide and high still reads the whole
+chain**. All copies vote bit by bit, so a few percent of damaged bits are
+corrected. The reader tries both modes and every crop offset by itself.
 
 ```bash
-python chain_imei.py append --input photo.jpg    --output photo_A.jpg   --device-id phone-A --imei 356938035643809
-python chain_imei.py append --input photo_A.jpg  --output photo_AB.jpg  --device-id phone-B --imei 490154203237518
-python chain_imei.py append --input photo_AB.jpg --output photo_ABC.jpg --device-id phone-C --imei 352099001761481 --role claim
-python chain_imei.py read   --input photo_ABC.jpg          # add --json for machine-readable output
+python chain_imei.py append --input photo.jpg    --output photo_A.png   --device-id phone-A --imei 356938035643809
+python chain_imei.py append --input photo_A.png  --output photo_AB.png  --device-id phone-B --imei 490154203237518 --bpp 6
+python chain_imei.py append --input photo_AB.png --output photo_ABC.png --device-id phone-C --imei 352099001761481 --role claim
+python chain_imei.py read   --input photo_ABC.png          # add --json for machine-readable output
 #  -> Path: 356938035643809 -> 490154203237518 -> 352099001761481
 
 python chain_imei.py append --input clip.mp4 --output clip_A.mp4 --device-id phone-A   # videos: same commands
 ```
+
+> 📄 Bit-by-bit description of the format (frame, pixel layout, tiles, MP4
+> box): [ChainStorageFormat.md](ChainStorageFormat.md)
+
+> Why photos are PNG: pixel LSBs only survive lossless storage. Saving as
+> JPEG, resizing, rotating or filtering recalculates every pixel and erases
+> the chain, so share stamped photos only as files (USB, Bluetooth).
 
 > Why videos don't use pixel LSBs: a phone video is lossy H.264/H.265, so
 > pixel LSBs only survive a *lossless* re-encode (the `video_lsb.py` mode).
 > That makes files 10–20× larger, and phones can't do it. Storing the chain
 > in the container keeps the video byte-for-byte intact.
 
-- **Image ID**: calculated from the original file's content (JPEG: the DC
-  and chroma coefficients; video: the `moov` index), which stamping never
-  changes. All copies of the same original get the same ID, so several
-  copies can be merged into a forwarding tree.
+- **Image ID**: calculated from the original file's content (photo: every
+  pixel with its 2 lowest bits cleared; video: the `moov` index), which
+  stamping never changes. All copies of the same original get the same ID,
+  so several copies can be merged into a forwarding tree.
 - **`send` / `claim`**: a device adds itself when it forwards the photo
   (`send`). The final receiver adds itself with `claim`.
 - If a device is already the last hop (e.g. it sends the same photo to two
   people), it is not added again.
-- Format: a fixed 176-byte frame with a CRC-32 (see `chain_payload.py`),
-  tiled every 128×128 px and recovered by majority vote.
+- Format: a fixed 2016-byte frame (header, 100 hop slots of 20 bytes,
+  CRC-32), the same for photos and videos (see `chain_payload.py`).
+- The mode can change from hop to hop: each hop rewrites the whole chain.
 
 ### 🌐 Backend API (forwarding tree)
 
@@ -142,7 +161,7 @@ python test_api.py                 # automated API tests (temporary database)
 
 | Endpoint | What it does |
 |----------|--------------|
-| `POST /api/upload` | Upload a JPEG photo or MP4/MOV/3GP video (`file` field, up to 1 GB). Returns its chain and the merged tree. |
+| `POST /api/upload` | Upload a PNG photo or MP4/MOV/3GP video (`file` field, up to 1 GB). Returns its chain, the photo mode (3 or 6 bits/pixel) and the merged tree. JPEGs are accepted but can't hold a chain. |
 | `GET /api/images` | One row per photo: copies, devices, origin |
 | `GET /api/images/{image_id}/tree` | The tree, nested (`root`) and flat (`nodes` + `edges`) |
 | `GET /api/uploads`, `GET /api/uploads/{id}`, `…/file`, `DELETE` | Uploaded copies |
@@ -183,7 +202,7 @@ is forwarded over Bluetooth. It works for **photos and videos**.
 
 | Module | What it is |
 |--------|-----------|
-| `android/core` | Pure-Kotlin chain library: the JPEG reader/writer (baseline **and** progressive) and MP4 box writer. It produces exactly the same chains as the Python code, which `LSB/test_kotlin_compat.py` checks. |
+| `android/core` | Pure-Kotlin chain library: a lossless PNG reader/writer, the RGB pixel-LSB chain (3 and 6 bits/pixel) and the MP4 box writer. It produces exactly the same pixels and files as the Python code, which `LSB/test_kotlin_compat.py` checks. |
 | `android/app` | The app (Jetpack Compose). |
 
 **Build and install**
@@ -197,7 +216,8 @@ is forwarded over Bluetooth. It works for **photos and videos**.
 **Demo with three phones (A → B → C)**
 
 1. On each phone, open ChainStamp once and type its IMEI (dial `*#06#` to see it).
-2. **Phone A:** *Choose a photo or video* → **Stamp & send** → pick *Bluetooth* → phone B.
+2. **Phone A:** *Choose a photo or video* → for a photo, pick **3 or 6 bits / pixel** →
+   **Stamp & send** → pick *Bluetooth* → phone B. (A JPEG is converted to PNG once.)
 3. **Phone B:** open the received file → *Share → ChainStamp* (or open ChainStamp →
    *Choose a photo or video*). The app shows **A**. Tap **Stamp & send** → Bluetooth → phone C.
 4. **Phone C:** open it the same way. The app shows **A → B**. Tap **Save as received**
@@ -222,6 +242,7 @@ cd LSB && python test_kotlin_compat.py             # Kotlin and Python produce i
 ```
 MiniProject/
 ├── README.md                 ← you are here (project overview)
+├── ChainStorageFormat.md     ← how the chain is stored, bit by bit (photos + videos)
 │
 ├── backend/                  ← FastAPI server for the dashboard
 │   ├── main.py               ← REST endpoints (upload, tree, devices)
@@ -230,7 +251,7 @@ MiniProject/
 │   └── test_api.py           ← automated API tests
 │
 ├── android/                  ← Android app (ChainStamp)
-│   ├── core/                 ← Kotlin chain library (JPEG + MP4), tested on a PC
+│   ├── core/                 ← Kotlin chain library (PNG pixels + MP4), tested on a PC
 │   └── app/                  ← the app (Jetpack Compose)
 │
 ├── dashboard/                ← React dashboard (Vite)
@@ -244,7 +265,8 @@ MiniProject/
     ├── jpeg_dct.py           ← JPEG mode: DCT-coefficient LSB
     ├── video_lsb.py          ← video mode: lossless MP4 frame LSB
     ├── chain_imei.py         ← forwarding chain: append / read device hops
-    ├── chain_payload.py      ← binary format of the chain (CRC-checked)
+    ├── chain_payload.py      ← binary format of the chain (100 hops, CRC-checked)
+    ├── pixel_chain.py        ← chain storage for photos (RGB pixel LSB, PNG)
     ├── mp4_chain.py          ← chain storage for videos (hidden MP4 box)
     ├── run_test.sh           ← automated tests for all three modes
     ├── test_chain.py         ← automated tests for the forwarding chain

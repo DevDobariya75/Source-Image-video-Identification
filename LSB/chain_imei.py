@@ -8,20 +8,21 @@ the file later gives the full path, e.g. A -> B -> C.
 
 Usage
 -----
-    # Phone A forwards the photo (first hop: a new chain is started)
-    python chain_imei.py append --input photo.jpg --output photo_A.jpg \
+    # Phone A forwards the photo (first hop: a new chain is started,
+    # the JPEG is converted once to a lossless PNG)
+    python chain_imei.py append --input photo.jpg --output photo_A.png \
         --device-id phone-A --imei 356938035643809
 
-    # Phone B forwards it on
-    python chain_imei.py append --input photo_A.jpg --output photo_AB.jpg \
-        --device-id phone-B --imei 490154203237518
+    # Phone B forwards it on, using 6 bits per pixel instead of 3
+    python chain_imei.py append --input photo_A.png --output photo_AB.png \
+        --device-id phone-B --imei 490154203237518 --bpp 6
 
     # Phone C, the final receiver, adds itself
-    python chain_imei.py append --input photo_AB.jpg --output photo_ABC.jpg \
+    python chain_imei.py append --input photo_AB.png --output photo_ABC.png \
         --device-id phone-C --imei 012345678901237 --role claim
 
     # Read the chain (add --json for machine-readable output)
-    python chain_imei.py read --input photo_ABC.jpg
+    python chain_imei.py read --input photo_ABC.png
 
     # Videos work the same way
     python chain_imei.py append --input clip.mp4 --output clip_A.mp4 --device-id phone-A
@@ -32,39 +33,33 @@ Usage
 
 How it is stored
 ----------------
-Both media types carry the same fixed 176-byte frame (chain_payload.py):
+Both media types carry the same fixed 2016-byte frame with room for 100
+hops (chain_payload.py):
 
-* Photos (JPEG): written into the LSBs of the JPEG's DCT coefficients, with
-  the same scheme as jpeg_dct.py but a larger tile of 16 x 16 blocks
-  (128 x 128 px), repeated over the whole photo and read by majority vote.
-  Each hop rewrites it in place without re-compressing the JPEG.
-  Other image formats (PNG, ...) are converted to JPEG once, at the first hop.
-* Videos (MP4 / MOV / 3GP): stored in a small hidden box at the end of the
-  file (mp4_chain.py); the video itself is never re-encoded.
+* Photos: written into the RGB pixel LSBs (pixel_chain.py), 3 or 6 bits per
+  pixel (--bpp), as a 74 x 74 or 52 x 52 px tile repeated over the whole
+  photo and read by majority vote. Photos are saved as PNG (lossless); a JPEG
+  or other format is converted once, at the first hop.
+* Videos (MP4 / MOV / 3GP): the complete frame is stored in one small hidden
+  box at the end of the file (mp4_chain.py); the video is never re-encoded.
 
 Both survive byte-for-byte transfers (Bluetooth, USB, e-mail attachment) but
-NOT re-compression (WhatsApp photo/video mode, editing, screenshots).
+NOT re-compression or resizing (WhatsApp photo/video mode, editing,
+screenshots).
 """
 
 import argparse
-import hashlib
 import json
 import os
 import sys
 from dataclasses import dataclass
 from typing import Optional
 
-import numpy as np
-
 import chain_payload as cp
-import jpeg_dct
 import mp4_chain
+import pixel_chain
 
-# Tile size in 8x8 blocks for the chain frame: 16 x 16 blocks x 16 freqs
-# = 4096 slots, enough for ~3 copies of the 1408-bit frame per tile.
-CHAIN_TILE_BLOCKS = 16
-
-IMAGE_OUTPUT_EXTENSIONS = {".jpg", ".jpeg"}
+IMAGE_OUTPUT_EXTENSIONS = pixel_chain.OUTPUT_EXTENSIONS
 
 MEDIA_IMAGE = "image"
 MEDIA_VIDEO = "video"
@@ -74,57 +69,28 @@ MEDIA_VIDEO = "video"
 class ReadResult:
     chain: cp.Chain
     media: str                 # "image" | "video"
-    dy: int = 0                # grid alignment (images only)
+    bits_per_pixel: Optional[int] = None   # 3 or 6 (images only)
+    dy: int = 0                # grid offset of the tile (images only)
     dx: int = 0
     confidence: float = 1.0    # vote confidence (always 1.0 for video)
-    votes_min: int = 1
+    votes_min: int = 1         # fewest copies any bit was read from
 
 
 def media_type(path: str) -> Optional[str]:
-    """'image' for a JPEG, 'video' for an MP4/MOV/3GP, else None (by content)."""
-    if jpeg_dct.is_jpeg_file(path):
+    """'image' for a PNG, 'video' for an MP4/MOV/3GP, else None (by content)."""
+    if pixel_chain.is_png_file(path):
         return MEDIA_IMAGE
     if mp4_chain.is_mp4_file(path):
         return MEDIA_VIDEO
     return None
 
 
-# ---------------------------------------------------------------------------
-# Images (JPEG DCT)
-# ---------------------------------------------------------------------------
-
-def _decode(Y: np.ndarray) -> Optional[ReadResult]:
-    """Try every grid offset; return the best one whose frame passes the CRC."""
-    best = None
-    for dy, dx, bits, confidence, missing, bn in jpeg_dct.vote_alignments(
-            Y, cp.FRAME_BITS, CHAIN_TILE_BLOCKS):
-        if missing:
-            continue
-        try:
-            chain = cp.unpack(np.packbits(bits).tobytes())
-        except cp.ChainError:
-            continue
-        r = ReadResult(chain, MEDIA_IMAGE, dy, dx, confidence, int(bn.min()))
-        if best is None or r.confidence > best.confidence:
-            best = r
-    return best
-
-
-def content_id(jpeg) -> bytes:
-    """
-    8-byte fingerprint of the photo, used as the Image ID of a new chain.
-
-    It hashes only data the chain never modifies: the DC coefficient of
-    every luminance block and all chroma coefficients. So the same original
-    photo always gets the same Image ID, even if it is stamped separately
-    for every receiver, and every copy lands in the same forwarding tree.
-    """
-    h = hashlib.sha256()
-    h.update(np.ascontiguousarray(jpeg.Y[:, :, 0, 0], dtype="<i2").tobytes())
-    for ch in (jpeg.Cb, jpeg.Cr):
-        if ch is not None:
-            h.update(np.ascontiguousarray(ch, dtype="<i2").tobytes())
-    return h.digest()[:cp.IMAGE_ID_BYTES]
+def _decode_image(rgb) -> Optional[ReadResult]:
+    r = pixel_chain.decode(rgb)
+    if r is None:
+        return None
+    return ReadResult(r.chain, MEDIA_IMAGE, r.bits_per_pixel, r.dy, r.dx,
+                      r.confidence, r.votes_min)
 
 
 def _next_chain(existing: Optional[cp.Chain], new_id: bytes, device_id: bytes,
@@ -146,11 +112,14 @@ def _next_chain(existing: Optional[cp.Chain], new_id: bytes, device_id: bytes,
 # ---------------------------------------------------------------------------
 
 def read_chain(path: str) -> Optional[ReadResult]:
-    """Read the chain from a JPEG or MP4. Returns None if there is no valid chain."""
+    """
+    Read the chain from a PNG photo or an MP4 video. Returns None if there is
+    no valid chain (other image formats, e.g. JPEG, can't hold one).
+    Raises ValueError for a damaged PNG / MP4.
+    """
     kind = media_type(path)
     if kind == MEDIA_IMAGE:
-        jpeg, _ = jpeg_dct.load_dct(path)
-        return _decode(jpeg.Y)
+        return _decode_image(pixel_chain.load_rgb(path))
     if kind == MEDIA_VIDEO:
         chain = mp4_chain.read(path)
         return ReadResult(chain, MEDIA_VIDEO) if chain else None
@@ -160,11 +129,15 @@ def read_chain(path: str) -> Optional[ReadResult]:
 def append_hop(input_path: str, output_path: str, device_id: bytes,
                imei: Optional[str], role: int = cp.ROLE_SEND,
                timestamp: Optional[int] = None, allow_repeat: bool = False,
-               quality: int = 95) -> dict:
+               bits_per_pixel: Optional[int] = None) -> dict:
     """
     Append one hop to the file's chain (starting a new chain if it has none)
-    and save the result. Photos are saved as JPEG, videos keep their format.
+    and save the result. Photos are saved as PNG, videos keep their format.
     Returns a summary dict.
+
+    bits_per_pixel (photos only): 3 or 6. None keeps the mode the photo was
+    already stamped with, or uses 3 for a new chain. The whole chain is
+    re-written in the chosen mode, so the mode may change from hop to hop.
 
     If the last hop already belongs to this device, nothing is added unless
     allow_repeat is True. This covers a phone that sends the same file to
@@ -182,19 +155,23 @@ def append_hop(input_path: str, output_path: str, device_id: bytes,
                                    device_id, imei, role, timestamp, allow_repeat)
         mp4_chain.write(input_path, output_path, chain)
         return {"chain": chain, "added": added, "new_chain": existing is None,
-                "recompressed": False, "media": MEDIA_VIDEO, "stats": None}
+                "converted": False, "media": MEDIA_VIDEO, "stats": None}
 
     if out_ext not in IMAGE_OUTPUT_EXTENSIONS:
-        raise ValueError("A photo must be saved as .jpg or .jpeg.")
-    jpeg, recompressed = jpeg_dct.load_dct(input_path, quality)
-    existing = None if recompressed else _decode(jpeg.Y)
-    chain, added = _next_chain(existing.chain if existing else None, content_id(jpeg),
+        raise ValueError("A photo must be saved as .png (lossless).")
+    if bits_per_pixel is not None and bits_per_pixel not in pixel_chain.MODES:
+        raise ValueError(f"Bits per pixel must be one of {sorted(pixel_chain.MODES)}.")
+    converted = not pixel_chain.is_png_file(input_path)
+    rgb = pixel_chain.load_rgb(input_path)
+    existing = None if converted else _decode_image(rgb)
+    chain, added = _next_chain(existing.chain if existing else None,
+                               pixel_chain.content_id(rgb),
                                device_id, imei, role, timestamp, allow_repeat)
-    bits = np.unpackbits(np.frombuffer(cp.pack(chain), dtype=np.uint8))
-    stats = jpeg_dct.write_bits(jpeg, bits, CHAIN_TILE_BLOCKS)
-    jpeg.write_dct(output_path)
+    bpp = bits_per_pixel or (existing.bits_per_pixel if existing else pixel_chain.DEFAULT_BPP)
+    stats = pixel_chain.write_frame(rgb, cp.pack(chain), bpp)
+    pixel_chain.save_png(output_path, rgb)
     return {"chain": chain, "added": added, "new_chain": existing is None,
-            "recompressed": recompressed, "media": MEDIA_IMAGE, "stats": stats}
+            "converted": converted, "media": MEDIA_IMAGE, "stats": stats}
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +199,17 @@ def cmd_append(args) -> int:
                   "Embedding anyway.")
         role = cp.ROLE_CLAIM if args.role == "claim" else cp.ROLE_SEND
         res = append_hop(args.input, args.output, device_id, imei, role,
-                         args.timestamp, args.allow_repeat, args.quality)
+                         args.timestamp, args.allow_repeat, args.bpp)
     except (ValueError, OSError, cp.ChainError) as e:
         sys.exit(f"[!] {e}")
 
+    s = res["stats"]
     where = ("hidden MP4 box, video not re-encoded" if res["media"] == MEDIA_VIDEO
-             else "JPEG DCT coefficients, no re-compression")
-    if res["recompressed"]:
-        print(f"[+] Input             : not a JPEG, compressed once at quality "
-              f"{args.quality}; new chain started")
+             else f"RGB pixel LSBs, {s['bits_per_pixel']} bits/pixel "
+                  f"({pixel_chain.MODES[s['bits_per_pixel']]} per channel), PNG")
+    if res["converted"]:
+        print("[+] Input             : not a PNG, converted once to lossless PNG; "
+              "new chain started")
     elif res["new_chain"]:
         print(f"[+] Input             : {res['media']} with no chain; new chain "
               "started (this device is the origin)")
@@ -241,9 +220,12 @@ def cmd_append(args) -> int:
         print("[i] This device is already the last hop; nothing added "
               "(use --allow-repeat to force).")
     _print_chain(res["chain"])
-    if res["stats"]:
-        s = res["stats"]
-        print(f"[+] Copies per bit    : min {s['votes_min']}, median {s['votes_median']}")
+    if s:
+        print(f"[+] Tile              : {s['tile']} x {s['tile']} px, repeated "
+              f"{s['copies']} times (full copies) over {s['size'][0]} x {s['size'][1]} px")
+        if "changed" in s:
+            print(f"[+] Values changed    : {s['changed']} / {s['values']} "
+                  f"({100 * s['changed'] / s['values']:.1f} %)")
     print(f"[+] Saved             : {args.output}")
     return 0
 
@@ -258,6 +240,7 @@ def cmd_read(args) -> int:
         out = {"found": res is not None}
         if res:
             out.update(res.chain.to_dict(), media=res.media,
+                       bits_per_pixel=res.bits_per_pixel,
                        confidence=round(res.confidence, 4),
                        alignment=[res.dy, res.dx], votes_min=res.votes_min)
         print(json.dumps(out, indent=2))
@@ -265,12 +248,14 @@ def cmd_read(args) -> int:
 
     if res is None:
         print("[-] No forwarding chain found.")
-        print("[-] The file was never stamped, is not a JPEG/MP4, or was "
-              "re-compressed (sent as a WhatsApp photo/video, edited, screenshotted).")
+        print("[-] The file was never stamped, is not a PNG/MP4, or was "
+              "re-compressed or resized (WhatsApp photo/video, editing, screenshot).")
         return 1
     print(f"[+] Media             : {res.media}")
     if res.media == MEDIA_IMAGE:
-        print(f"[+] Grid alignment    : dy={res.dy}, dx={res.dx} blocks")
+        print(f"[+] Mode              : RGB LSB, {res.bits_per_pixel} bits/pixel")
+        print(f"[+] Grid alignment    : dy={res.dy}, dx={res.dx} px")
+        print(f"[+] Copies per bit    : min {res.votes_min}")
         print(f"[+] Vote confidence   : {res.confidence * 100:.1f} %")
     _print_chain(res.chain)
     return 0
@@ -285,7 +270,7 @@ def main() -> int:
     a.add_argument("--input", "--image", required=True, dest="input",
                    help="Input photo or video")
     a.add_argument("--output", required=True,
-                   help="Output path: .jpg/.jpeg for photos, .mp4/.mov/.3gp for videos")
+                   help="Output path: .png for photos, .mp4/.mov/.3gp for videos")
     a.add_argument("--device-id", required=True,
                    help="16-hex ANDROID_ID, or any text (hashed to 8 bytes)")
     a.add_argument("--imei", default=None, help="15-digit IMEI (optional)")
@@ -295,8 +280,9 @@ def main() -> int:
                    help="Unix time of the hop (default: now)")
     a.add_argument("--allow-repeat", action="store_true",
                    help="Add a hop even if this device is already the last one")
-    a.add_argument("--quality", type=int, default=95,
-                   help="JPEG quality used only if the input photo is not a JPEG")
+    a.add_argument("--bpp", type=int, choices=sorted(pixel_chain.MODES), default=None,
+                   help="Photos: 3 = 1 bit per R/G/B value, 6 = 2 bits per value "
+                        "(default: keep the photo's current mode, 3 for a new chain)")
     a.set_defaults(func=cmd_append)
 
     r = sub.add_parser("read", help="Show the file's chain")

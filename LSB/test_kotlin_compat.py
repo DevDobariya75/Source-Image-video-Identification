@@ -3,13 +3,15 @@
 test_kotlin_compat.py - Check that the Android app's Kotlin chain code
 (android/core) and this Python code read and write IDENTICAL chains.
 
-1. Makes test photos (4:2:0, 4:2:2, 4:4:4, grayscale, odd sizes, restart
-   markers, EXIF, progressive) and videos, and stamps them with Python.
+1. Makes test photos (PNG: RGB, RGBA, grayscale, palette, odd sizes, a
+   12 MP photo) and videos, and stamps them with Python in both photo modes
+   (3 and 6 bits per pixel). Also adds files Kotlin must refuse (16-bit and
+   interlaced PNG, JPEG), which the app converts first.
 2. Runs the Kotlin tests on them (gradlew :core:test). Kotlin checks it
    computes the same Image IDs, reads Python's chains, and stamps its own
    copies.
-3. Checks Kotlin's output with Python: chain readable, and the luminance
-   coefficients exactly equal to what Python wrote.
+3. Checks Kotlin's output with Python: chain readable, and the stamped
+   pixels exactly equal to the ones Python wrote.
 
 Usage:  python test_kotlin_compat.py        (needs Java; Gradle is downloaded)
 """
@@ -18,13 +20,14 @@ import os
 import shutil
 import subprocess
 import sys
+import zlib
 
 import cv2
 import numpy as np
 
 import chain_imei as ci
 import chain_payload as cp
-import jpeg_dct
+import pixel_chain
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "test_out", "kotlin_compat")
@@ -55,11 +58,31 @@ def textured(h, w, seed=1):
     return cv2.GaussianBlur(np.clip(img, 0, 255).astype(np.uint8), (3, 3), 0)
 
 
-def add_exif(path):
-    b = open(path, "rb").read()
-    exif = b"Exif\x00\x00MM\x00\x2a\x00\x00\x00\x08\x00\x01\x01\x12\x00\x03\x00\x00\x00\x01\x00\x06\x00\x00\x00\x00\x00\x00"
-    seg = b"\xff\xe1" + (len(exif) + 2).to_bytes(2, "big") + exif
-    open(path, "wb").write(b[:2] + seg + b[2:])
+def png_chunk(kind, data):
+    return (len(data).to_bytes(4, "big") + kind + data
+            + zlib.crc32(kind + data).to_bytes(4, "big"))
+
+
+def write_palette_png(path, h, w, seed=7):
+    """8-bit palette PNG (OpenCV can't write one)."""
+    rng = np.random.default_rng(seed)
+    pal = rng.integers(0, 256, (256, 3), dtype=np.uint8)
+    idx = rng.integers(0, 256, (h, w), dtype=np.uint8)
+    raw = b"".join(b"\x00" + idx[y].tobytes() for y in range(h))
+    ihdr = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 3, 0, 0, 0])
+    with open(path, "wb") as f:
+        f.write(pixel_chain.PNG_SIGNATURE + png_chunk(b"IHDR", ihdr)
+                + png_chunk(b"PLTE", pal.tobytes()) + png_chunk(b"IDAT", zlib.compress(raw))
+                + png_chunk(b"IEND", b""))
+
+
+def write_interlaced_png(path, h, w):
+    """Header says Adam7-interlaced: Kotlin must refuse it (the app converts it)."""
+    raw = b"".join(b"\x00" + bytes(3 * w) for _ in range(h))
+    ihdr = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, 2, 0, 0, 1])
+    with open(path, "wb") as f:
+        f.write(pixel_chain.PNG_SIGNATURE + png_chunk(b"IHDR", ihdr)
+                + png_chunk(b"IDAT", zlib.compress(raw)) + png_chunk(b"IEND", b""))
 
 
 def make_video(path):
@@ -79,31 +102,38 @@ def build_vectors():
     shutil.rmtree(OUT, ignore_errors=True)
     os.makedirs(OUT, exist_ok=True)
     img = textured(480, 640)
-    S = cv2.IMWRITE_JPEG_SAMPLING_FACTOR
-    cases = {
-        "s420.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 90, S, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_420]),
-        "s422.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 90, S, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_422]),
-        "s444.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 90, S, cv2.IMWRITE_JPEG_SAMPLING_FACTOR_444]),
-        "gray.jpg": (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), [cv2.IMWRITE_JPEG_QUALITY, 90]),
-        "odd.jpg": (textured(301, 437, 2), [cv2.IMWRITE_JPEG_QUALITY, 85]),
-        "restart.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 90, cv2.IMWRITE_JPEG_RST_INTERVAL, 7]),
-        "exif.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 95]),
-        "large_12mp.jpg": (cv2.resize(textured(750, 1000, 4), (4000, 3000), interpolation=cv2.INTER_CUBIC), [cv2.IMWRITE_JPEG_QUALITY, 92]),
-        "progressive.jpg": (img, [cv2.IMWRITE_JPEG_QUALITY, 90, cv2.IMWRITE_JPEG_PROGRESSIVE, 1]),
-        "progressive_gray.jpg": (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY), [cv2.IMWRITE_JPEG_QUALITY, 80, cv2.IMWRITE_JPEG_PROGRESSIVE, 1]),
-        "progressive_rst.jpg": (textured(301, 437, 3), [cv2.IMWRITE_JPEG_QUALITY, 92, cv2.IMWRITE_JPEG_PROGRESSIVE, 1, cv2.IMWRITE_JPEG_RST_INTERVAL, 5]),
+    rgba = np.dstack([img, np.full(img.shape[:2], 200, np.uint8)])
+    images = {
+        "rgb.png": img,
+        "rgba.png": rgba,
+        "gray.png": cv2.cvtColor(img, cv2.COLOR_BGR2GRAY),
+        "odd.png": textured(301, 437, 2),
+        "large_12mp.png": cv2.resize(textured(750, 1000, 4), (4000, 3000),
+                                     interpolation=cv2.INTER_CUBIC),
     }
     lines = []
-    for name, (im, params) in cases.items():
-        cv2.imwrite(p(name), im, params)
-        if name == "exif.jpg":
-            add_exif(p(name))
-        lines.append(stamp_entry(name, "image"))
+    for name, im in images.items():
+        cv2.imwrite(p(name), im)
+    write_palette_png(p("palette.png"), 233, 157)
+    names = list(images) + ["palette.png"]
+    for name in names:
+        for bpp in pixel_chain.MODES:
+            base, ext = os.path.splitext(name)
+            mode_name = f"{base}_{bpp}bpp{ext}"
+            shutil.copyfile(p(name), p(mode_name))
+            lines.append(stamp_entry(mode_name, "image", bpp=bpp))
 
-    real = os.path.join(HERE, "testimage.jpeg")
+    real = os.path.join(HERE, "..", "test_image", "image1.jpeg")
     if os.path.exists(real):
-        shutil.copyfile(real, p("real_photo.jpg"))
-        lines.append(stamp_entry("real_photo.jpg", "image"))
+        cv2.imwrite(p("real_photo.png"), cv2.imread(real))
+        lines.append(stamp_entry("real_photo.png", "image", bpp=3))
+
+    # Files the Kotlin library must refuse (the app converts them to PNG).
+    cv2.imwrite(p("deep16.png"), (textured(80, 90).astype(np.uint16) * 257))
+    write_interlaced_png(p("interlaced.png"), 80, 90)
+    cv2.imwrite(p("photo.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    for name in ("deep16.png", "interlaced.png", "photo.jpg"):
+        lines.append(stamp_entry(name, "image", unsupported=True))
 
     make_video(p("clip.mp4"))
     lines.append(stamp_entry("clip.mp4", "video"))
@@ -117,16 +147,17 @@ def build_vectors():
     return lines
 
 
-def stamp_entry(name, kind, unsupported=False):
+def stamp_entry(name, kind, unsupported=False, bpp=None):
+    """Manifest line: name|kind|file|py_stamped|content_id|unsupported|imei|ts|bpp"""
     if unsupported:
-        return f"{name}|{kind}|{name}|||1|{IMEI}|{TS}"
+        return f"{name}|{kind}|{name}|||1|{IMEI}|{TS}|"
     if kind == "image":
-        cid = ci.content_id(jpeg_dct.load_dct(p(name))[0]).hex()
+        cid = pixel_chain.content_id(pixel_chain.load_rgb(p(name))).hex()
     else:
         import mp4_chain
         cid = mp4_chain.content_id(p(name)).hex()
-    ci.append_hop(p(name), p("py_" + name), DEV_A, IMEI, cp.ROLE_SEND, TS)
-    return f"{name}|{kind}|{name}|py_{name}|{cid}|0|{IMEI}|{TS}"
+    ci.append_hop(p(name), p("py_" + name), DEV_A, IMEI, cp.ROLE_SEND, TS, bits_per_pixel=bpp)
+    return f"{name}|{kind}|{name}|py_{name}|{cid}|0|{IMEI}|{TS}|{bpp or ''}"
 
 
 def run_kotlin():
@@ -144,7 +175,7 @@ def run_kotlin():
 
 def verify(lines):
     for line in lines:
-        name, kind, _, _, _, unsupported, _, _ = line.split("|")
+        name, kind, _, _, _, unsupported, _, _, bpp = line.split("|")
         if unsupported == "1":
             continue
         kt, py, kt2 = p("kt_" + name), p("py_" + name), p("kt2_" + name)
@@ -160,18 +191,9 @@ def verify(lines):
             check(f"{name}: Kotlin and Python video files are byte-identical",
                   open(kt, "rb").read() == open(py, "rb").read())
             continue
-        a, b, o = (jpeg_dct.load_dct(x)[0] for x in (kt, py, p(name)))
-        check(f"{name}: luminance coefficients identical to Python's",
-              np.array_equal(a.Y, b.Y))
-        same_chroma = all(
-            (getattr(a, c) is None and getattr(o, c) is None)
-            or np.array_equal(getattr(a, c), getattr(o, c)) for c in ("Cb", "Cr"))
-        check(f"{name}: chroma untouched", same_chroma)
-        if name == "exif.jpg":
-            check(f"{name}: EXIF kept", b"Exif\x00\x00MM" in open(kt, "rb").read())
-        size_in, size_out = os.path.getsize(p(name)), os.path.getsize(kt)
-        check(f"{name}: size change {100 * (size_out - size_in) / size_in:+.2f}% (< 2%)",
-              abs(size_out - size_in) < 0.02 * size_in)
+        a, b = pixel_chain.load_rgb(kt), pixel_chain.load_rgb(py)
+        check(f"{name}: pixels identical to Python's ({bpp} bits/pixel)", np.array_equal(a, b))
+        check(f"{name}: read back in {bpp}-bit mode", res is not None and res.bits_per_pixel == int(bpp))
 
 
 def main():

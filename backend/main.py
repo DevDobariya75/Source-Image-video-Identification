@@ -2,8 +2,10 @@
 main.py - REST API for the forwarding-chain dashboard.
 
 Upload a photo or video -> the backend decodes the chain hidden in it
-(LSB/chain_imei.py), stores it, and merges it with every other copy of the
-same original (same Image ID) into a forwarding tree.
+(LSB/chain_imei.py: RGB pixel LSB in PNG photos, a hidden box in MP4 videos),
+stores it, and merges it with every other copy of the same original (same
+Image ID) into a forwarding tree. JPEGs are accepted but can't carry a chain
+(a stamped photo is always a PNG), so they are listed as "no chain found".
 
 Run:   uvicorn main:app --reload            (from the backend/ folder)
 Docs:  http://127.0.0.1:8000/docs           (interactive, try uploads there)
@@ -11,7 +13,7 @@ Docs:  http://127.0.0.1:8000/docs           (interactive, try uploads there)
 Endpoints
 ---------
 GET    /api/health
-POST   /api/upload                    multipart "file" (JPEG / MP4 / MOV / 3GP)
+POST   /api/upload                    multipart "file" (PNG / JPEG / MP4 / MOV / 3GP)
 GET    /api/uploads[?image_id=...]    list uploads
 GET    /api/uploads/{id}              one upload with its chain
 GET    /api/uploads/{id}/file         the uploaded photo or video
@@ -43,7 +45,6 @@ from tree import build_tree
 # The decoding code lives in the LSB technique folder.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "LSB"))
 import chain_imei  # noqa: E402
-import jpeg_dct  # noqa: E402
 
 # Videos can be large; the upload is streamed to disk, never held in memory.
 MAX_UPLOAD_BYTES = int(os.environ.get("CHAIN_MAX_UPLOAD_MB", "1024")) * 1024 * 1024
@@ -127,7 +128,9 @@ def _save_upload(file: UploadFile) -> tuple:
         os.remove(tmp)
         raise
 
-    if head.startswith(b"\xff\xd8\xff"):
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        media, ext = "image", ".png"
+    elif head.startswith(b"\xff\xd8\xff"):
         media, ext = "image", ".jpg"
     elif head[4:8] == b"ftyp":
         brand = head[8:12]
@@ -135,8 +138,8 @@ def _save_upload(file: UploadFile) -> tuple:
         ext = next((e for b, e in VIDEO_EXT_BY_BRAND.items() if brand.startswith(b)), ".mp4")
     else:
         os.remove(tmp)
-        raise HTTPException(415, "Unsupported file. Upload a JPEG photo or an "
-                                 "MP4 / MOV / 3GP video.")
+        raise HTTPException(415, "Unsupported file. Upload a PNG (or JPEG) photo "
+                                 "or an MP4 / MOV / 3GP video.")
     return tmp, h.hexdigest(), size, media, ext
 
 
@@ -144,7 +147,7 @@ def _decode(path: str, media: str) -> Optional[chain_imei.ReadResult]:
     try:
         return chain_imei.read_chain(path)
     except (ValueError, OSError) as e:
-        kind = "JPEG" if media == "image" else "video"
+        kind = "photo" if media == "image" else "video"
         raise HTTPException(422, f"Could not read this {kind}: {e}") from e
 
 
@@ -174,11 +177,13 @@ def upload(file: UploadFile = File(...)):
         with db.connect() as con:
             cur = con.execute(
                 "INSERT INTO uploads (sha256, filename, media, ext, size_bytes, uploaded_at, "
-                "found, image_id, confidence, hop_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "found, image_id, confidence, hop_count, bits_per_pixel) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (sha, filename, media, ext, size, db.now_iso(), int(res is not None),
                  res.chain.image_id.hex() if res else None,
                  round(res.confidence, 4) if res else None,
-                 len(res.chain.hops) if res else 0))
+                 len(res.chain.hops) if res else 0,
+                 res.bits_per_pixel if res else None))
             upload_id = cur.lastrowid
             if res:
                 con.executemany(
@@ -199,7 +204,7 @@ def _stored_path(sha: str, ext: str) -> Path:
     return db.FILES_DIR / f"{sha}{ext}"
 
 
-MEDIA_TYPES = {".jpg": "image/jpeg", ".mp4": "video/mp4", ".mov": "video/quicktime",
+MEDIA_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".mp4": "video/mp4", ".mov": "video/quicktime",
                ".3gp": "video/3gpp", ".3g2": "video/3gpp2"}
 
 
@@ -207,7 +212,7 @@ MEDIA_TYPES = {".jpg": "image/jpeg", ".mp4": "video/mp4", ".mov": "video/quickti
 def list_uploads(image_id: Optional[str] = None):
     with db.connect() as con:
         sql = ("SELECT id, filename, media, size_bytes, uploaded_at, found, image_id, "
-               "confidence, hop_count FROM uploads")
+               "confidence, hop_count, bits_per_pixel FROM uploads")
         args = ()
         if image_id:
             sql += " WHERE image_id = ?"
