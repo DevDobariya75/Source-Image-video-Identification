@@ -2,8 +2,9 @@
 """
 test_api.py - End-to-end tests for the backend, using a throw-away database.
 
-Builds this forwarding tree with the real chain code, uploads the copies
-held by C and D, and checks what the API returns:
+Builds this forwarding tree with the real chain code (PNG photos with the
+chain in their RGB pixel LSBs, and MP4 videos), uploads the copies held by
+C and D, and checks what the API returns:
 
         A
        / \\
@@ -63,13 +64,16 @@ def make_photos() -> None:
     cv2.imwrite(p("cover.jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
 
     t = 1792500000
-    ci.append_hop(p("cover.jpg"), p("A.jpg"), DEV["A"], IMEI["A"], timestamp=t)
-    ci.append_hop(p("A.jpg"), p("AB.jpg"), DEV["B"], IMEI["B"], timestamp=t + 60)
-    ci.append_hop(p("AB.jpg"), p("ABC.jpg"), DEV["C"], IMEI["C"], cp.ROLE_CLAIM, t + 120)
-    ci.append_hop(p("A.jpg"), p("AD.jpg"), DEV["D"], IMEI["D"], cp.ROLE_CLAIM, t + 90)
-    cv2.imwrite(p("recompressed.jpg"), cv2.imread(p("ABC.jpg")),
+    ci.append_hop(p("cover.jpg"), p("A.png"), DEV["A"], IMEI["A"], timestamp=t)
+    ci.append_hop(p("A.png"), p("AB.png"), DEV["B"], IMEI["B"], timestamp=t + 60,
+                  bits_per_pixel=6)
+    ci.append_hop(p("AB.png"), p("ABC.png"), DEV["C"], IMEI["C"], cp.ROLE_CLAIM, t + 120)
+    ci.append_hop(p("A.png"), p("AD.png"), DEV["D"], IMEI["D"], cp.ROLE_CLAIM, t + 90)
+    cv2.imwrite(p("recompressed.jpg"), cv2.imread(p("ABC.png")),
                 [cv2.IMWRITE_JPEG_QUALITY, 85])
-    cv2.imwrite(p("photo.png"), img)
+    cv2.imwrite(p("plain.png"), img)
+    with open(p("photo.gif"), "wb") as f:
+        f.write(b"GIF89a" + bytes(40))
 
 
 def make_videos() -> None:
@@ -111,15 +115,16 @@ def check_migration() -> None:
     try:
         db.init()
         with db.connect() as c:
-            row = dict(c.execute("SELECT media, ext FROM uploads").fetchone())
+            row = dict(c.execute("SELECT media, ext, bits_per_pixel FROM uploads").fetchone())
     finally:
         db.DB_PATH, db.FILES_DIR = saved
-    check("old rows get media = image, ext = .jpg", row == {"media": "image", "ext": ".jpg"})
+    check("old rows get media = image, ext = .jpg, bits_per_pixel = NULL",
+          row == {"media": "image", "ext": ".jpg", "bits_per_pixel": None})
 
 
 def upload(client, name: str):
     with open(p(name), "rb") as f:
-        return client.post("/api/upload", files={"file": (name, f, "image/jpeg")})
+        return client.post("/api/upload", files={"file": (name, f, "application/octet-stream")})
 
 
 def labels_of(node) -> list:
@@ -132,8 +137,8 @@ def main() -> int:
         print("1. Health")
         check("GET /api/health", client.get("/api/health").json() == {"status": "ok"})
 
-        print("2. Upload C's copy (A -> B -> C)")
-        r = upload(client, "ABC.jpg")
+        print("2. Upload C's copy (A -> B -> C, PNG)")
+        r = upload(client, "ABC.png")
         body = r.json()
         check("200 OK", r.status_code == 200)
         check("chain found", body["upload"]["found"])
@@ -141,9 +146,11 @@ def main() -> int:
               [h["imei"] for h in body["upload"]["hops"]] == [IMEI["A"], IMEI["B"], IMEI["C"]])
         image_id = body["upload"]["image_id"]
         check("tree returned with 3 devices", body["tree"]["stats"]["devices"] == 3)
+        check("mode stored: 6 bits/pixel (kept from B's hop)",
+              body["upload"]["bits_per_pixel"] == 6 and body["upload"]["ext"] == ".png")
 
         print("3. Upload D's copy (A -> D): branches off A")
-        body = upload(client, "AD.jpg").json()
+        body = upload(client, "AD.png").json()
         check("same image ID as C's copy", body["upload"]["image_id"] == image_id)
         tree = client.get(f"/api/images/{image_id}/tree").json()
         root = tree["root"]
@@ -161,18 +168,21 @@ def main() -> int:
         check("no anomalies", tree["anomalies"] == [])
 
         print("4. Duplicates and bad files")
-        body = upload(client, "ABC.jpg").json()
+        body = upload(client, "ABC.png").json()
         check("same file again is a duplicate", body["duplicate"])
         check("still 2 uploads", len(client.get("/api/uploads").json()) == 2)
-        r = upload(client, "cover.jpg")
-        check("unstamped JPEG: found = false",
+        r = upload(client, "plain.png")
+        check("unstamped PNG: found = false",
               r.status_code == 200 and not r.json()["upload"]["found"] and r.json()["tree"] is None)
+        r = upload(client, "cover.jpg")
+        check("JPEG accepted but can't carry a chain: found = false",
+              r.status_code == 200 and not r.json()["upload"]["found"])
         r = upload(client, "recompressed.jpg")
-        check("re-compressed copy: found = false", not r.json()["upload"]["found"])
-        r = upload(client, "photo.png")
-        check("PNG rejected with 415", r.status_code == 415)
-        r = client.post("/api/upload", files={"file": ("x.jpg", b"\xff\xd8\xff garbage", "image/jpeg")})
-        check("corrupt JPEG rejected with 422", r.status_code == 422)
+        check("copy re-compressed to JPEG: found = false", not r.json()["upload"]["found"])
+        r = upload(client, "photo.gif")
+        check("GIF rejected with 415", r.status_code == 415)
+        r = client.post("/api/upload", files={"file": ("x.png", b"\x89PNG\r\n\x1a\n garbage", "image/png")})
+        check("corrupt PNG rejected with 422", r.status_code == 422)
 
         print("5. Images and devices")
         images = client.get("/api/images").json()
@@ -196,8 +206,9 @@ def main() -> int:
         print("6. Files and deletion")
         first = client.get("/api/uploads").json()[-1]
         r = client.get(f"/api/uploads/{first['id']}/file")
-        check("download the uploaded photo",
-              r.status_code == 200 and r.content == open(p("ABC.jpg"), "rb").read())
+        check("download the uploaded photo (image/png, same bytes)",
+              r.status_code == 200 and r.headers["content-type"] == "image/png"
+              and r.content == open(p("ABC.png"), "rb").read())
         client.delete(f"/api/uploads/{first['id']}")
         tree = client.get(f"/api/images/{image_id}/tree").json()
         check("after deleting C's copy the tree is A -> D only",
@@ -237,7 +248,7 @@ def main() -> int:
                                                         "video/mp4")})
         check("corrupt MP4 rejected with 422", r.status_code == 422)
 
-    print("8. Upgrading a database from before video support")
+    print("8. Upgrading a database from before video support / RGB pixel mode")
     check_migration()
 
     shutil.rmtree(TMP, ignore_errors=True)

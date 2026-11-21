@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS uploads (
     found        INTEGER NOT NULL,          -- 1 if a valid chain was decoded
     image_id     TEXT,                      -- chain image ID (hex), NULL if none
     confidence   REAL,
-    hop_count    INTEGER NOT NULL DEFAULT 0
+    hop_count    INTEGER NOT NULL DEFAULT 0,
+    bits_per_pixel INTEGER                  -- photos: 3 or 6 (RGB LSB mode), NULL otherwise
 );
 CREATE INDEX IF NOT EXISTS uploads_image ON uploads(image_id);
 
@@ -71,9 +72,11 @@ def init() -> None:
     with connect() as con:
         con.execute("PRAGMA journal_mode = WAL")
         con.executescript(SCHEMA)
-        # Databases created before video support lack these columns.
+        # Databases created before video support / RGB pixel mode lack these columns.
         cols = {r["name"] for r in con.execute("PRAGMA table_info(uploads)")}
         if "media" not in cols:
             con.execute("ALTER TABLE uploads ADD COLUMN media TEXT NOT NULL DEFAULT 'image'")
         if "ext" not in cols:
             con.execute("ALTER TABLE uploads ADD COLUMN ext TEXT NOT NULL DEFAULT '.jpg'")
+        if "bits_per_pixel" not in cols:
+            con.execute("ALTER TABLE uploads ADD COLUMN bits_per_pixel INTEGER")

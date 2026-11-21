@@ -106,7 +106,8 @@ function ResultCard({ item }) {
       {up && !up.found && (
         <p className="muted small">
           No forwarding chain in this file. It was never stamped by the app, or it was
-          re-compressed on the way (sent as a WhatsApp photo or video, edited, or a screenshot).
+          re-compressed or resized on the way (saved as JPEG, sent as a WhatsApp photo or video,
+          edited, or a screenshot). Stamped photos are always PNG files.
         </p>
       )}
 
@@ -117,6 +118,7 @@ function ResultCard({ item }) {
             <span>
               {up.media === "video" ? "Video" : "Photo"} ID <span className="mono">{shortId(up.image_id)}</span>
             </span>
+            {up.bits_per_pixel && <span>RGB LSB, {up.bits_per_pixel} bits/pixel</span>}
             <span>Decode confidence {Math.round(up.confidence * 100)}%</span>
             <a href={`#/photos/${up.image_id}`}>View tree →</a>
           </div>
