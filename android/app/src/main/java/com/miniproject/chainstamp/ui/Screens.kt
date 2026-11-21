@@ -30,6 +30,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -56,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.miniproject.chain.Hop
 import com.miniproject.chain.MediaType
+import com.miniproject.chain.PixelChain
 import com.miniproject.chain.Role
 import com.miniproject.chainstamp.ChainViewModel
 import com.miniproject.chainstamp.LoadedFile
@@ -115,6 +117,8 @@ fun ChainStampApp(vm: ChainViewModel) {
                     file = file,
                     myDeviceId = state.deviceIdHex,
                     busy = state.busy != null,
+                    bitsPerPixel = state.bitsPerPixel,
+                    onBitsPerPixel = vm::setBitsPerPixel,
                     onSend = vm::stampAndSend,
                     onSave = vm::saveAsReceived,
                 )
@@ -174,8 +178,9 @@ private fun HomeScreen(state: UiState, onPick: () -> Unit, onEditImei: () -> Uni
             Step(3, "The last phone taps Save as received to add itself and keep the file.")
             Step(4, "Upload any copy to the dashboard to see the whole forwarding tree.")
             Text(
-                "Always send the file itself (Bluetooth, Quick Share, USB). Apps that re-compress " +
-                    "photos or videos, like WhatsApp in normal mode, erase the chain.",
+                "Photos are saved as PNG (lossless) with the chain hidden in their pixels, " +
+                    "repeated all over the photo. Always send the file itself (Bluetooth, USB). " +
+                    "Re-compressing or resizing, like WhatsApp in normal mode, erases the chain.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -200,6 +205,8 @@ private fun FileScreen(
     file: LoadedFile,
     myDeviceId: String,
     busy: Boolean,
+    bitsPerPixel: Int,
+    onBitsPerPixel: (Int) -> Unit,
     onSend: () -> Unit,
     onSave: () -> Unit,
 ) {
@@ -213,6 +220,13 @@ private fun FileScreen(
             )
             file.note?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.tertiary)
+            }
+            file.bitsPerPixel?.let {
+                Text(
+                    "Chain stored with $it bits per pixel",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }
@@ -241,6 +255,10 @@ private fun FileScreen(
         )
     }
 
+    if (file.media == MediaType.IMAGE) {
+        ModeChooser(bitsPerPixel, enabled = !busy, onSelect = onBitsPerPixel)
+    }
+
     Button(onClick = onSend, enabled = !busy, modifier = Modifier.fillMaxWidth().height(56.dp)) {
         Icon(Icons.AutoMirrored.Filled.Send, contentDescription = null)
         Spacer(Modifier.width(8.dp))
@@ -257,6 +275,38 @@ private fun FileScreen(
         style = MaterialTheme.typography.bodySmall,
         color = MaterialTheme.colorScheme.onSurfaceVariant,
     )
+}
+
+/** 3 or 6 bits per pixel: how many low bits of each R, G, B value carry the chain. */
+@Composable
+private fun ModeChooser(selected: Int, enabled: Boolean, onSelect: (Int) -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("Hide the chain using", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for (bpp in PixelChain.MODES) {
+                    FilterChip(
+                        selected = selected == bpp,
+                        onClick = { onSelect(bpp) },
+                        enabled = enabled,
+                        label = { Text("$bpp bits / pixel") },
+                    )
+                }
+            }
+            val side = PixelChain.tileSide(selected)
+            Text(
+                if (selected == 3) {
+                    "1 bit in each R, G, B value (changes it by at most 1). Invisible. " +
+                        "A full copy of the chain every $side × $side pixels."
+                } else {
+                    "2 bits in each R, G, B value (changes it by at most 3). Still invisible in " +
+                        "normal photos, and twice as many copies: one every $side × $side pixels."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
 }
 
 @Composable
