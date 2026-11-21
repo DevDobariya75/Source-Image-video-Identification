@@ -22,6 +22,8 @@ tasks.test {
     // Folder of files made by LSB/test_kotlin_compat.py, to check that the
     // Kotlin and Python implementations read and write identical chains.
     systemProperty("vectors.dir", providers.gradleProperty("vectorsDir").getOrElse(""))
+    systemProperty("bench", providers.gradleProperty("bench").getOrElse(""))
+    maxHeapSize = "2g"
     testLogging {
         events("passed", "skipped", "failed")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL

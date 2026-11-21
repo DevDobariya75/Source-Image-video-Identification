@@ -11,17 +11,19 @@ a Bluetooth chain is not practical.
 Instead the chain goes into the MP4 *container*. An MP4 file is a list of
 "boxes" (size + type + data): ftyp, moov (the index), mdat (the video and
 audio data), ... Players skip box types they don't know. We add one box of
-type "uuid" with our own 16-byte ID, holding the same 176-byte chain frame
-as the JPEG mode (chain_payload.py), scrambled with a fixed keystream so
-it is not readable text.
+type "uuid" with our own 16-byte ID, holding the COMPLETE chain: the same
+2016-byte frame (100 hop slots) as photos use (chain_payload.py), scrambled
+with a fixed keystream so it is not readable text.
 
-    [ftyp][moov][mdat] ... [uuid: CHAIN_UUID | scrambled 176-byte frame]
+    [ftyp][moov][mdat] ... [uuid: CHAIN_UUID | scrambled 2016-byte frame]
 
 * No re-encoding: the video and audio bytes are untouched, and the file
-  grows by exactly 200 bytes.
+  grows by exactly 2040 bytes (24-byte box header + frame).
 * The box is appended at the END of the file, so the absolute offsets
   stored in moov (stco/co64 tables) stay valid.
 * Later hops overwrite the box in place (it always has the same size).
+  A box in the old 8-hop format (200 bytes) is renamed to "free" (a
+  standard "ignore me" box) and a new box is appended.
 * Image ID = hash of the moov box, which we never change: every copy of
   the same original video gets the same ID.
 
@@ -41,7 +43,7 @@ import chain_payload as cp
 # Our box's 16-byte "extended type" (randomly generated once, never change).
 CHAIN_UUID = bytes.fromhex("6b1f8e3a52c94d07a3e1d9c46f20b8a5")
 BOX_HEADER = 8 + 16                        # size + "uuid" + extended type
-BOX_SIZE = BOX_HEADER + cp.FRAME_BYTES     # 200 bytes
+BOX_SIZE = BOX_HEADER + cp.FRAME_BYTES     # 2040 bytes
 
 VIDEO_EXTENSIONS = {".mp4", ".m4v", ".mov", ".3gp", ".3g2"}
 
@@ -107,11 +109,13 @@ def top_level_boxes(f) -> List[dict]:
     return boxes
 
 
+def _our_boxes(boxes: List[dict]) -> List[dict]:
+    return [b for b in boxes if b["type"] == b"uuid" and b["uuid"] == CHAIN_UUID]
+
+
 def _find_chain_box(boxes: List[dict]) -> Optional[dict]:
-    for b in boxes:
-        if b["type"] == b"uuid" and b["uuid"] == CHAIN_UUID and b["size"] == BOX_SIZE:
-            return b
-    return None
+    """Our box in the current format (old 200-byte boxes are ignored)."""
+    return next((b for b in _our_boxes(boxes) if b["size"] == BOX_SIZE), None)
 
 
 def content_id(path: str) -> bytes:
@@ -163,6 +167,9 @@ def write(src: str, dst: str, chain: cp.Chain) -> None:
             f.seek(box["offset"])
             f.write(payload)
             return
+        for old in _our_boxes(boxes):            # old-format box: hide it
+            f.seek(old["offset"] + 4)
+            f.write(b"free")
 
         last = boxes[-1]
         if last["open_ended"]:

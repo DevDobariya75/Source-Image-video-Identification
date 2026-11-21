@@ -3,24 +3,25 @@ chain_payload.py - Binary format of the forwarding chain stored in an image.
 
 The chain records every device an image passed through (A -> B -> C ...).
 It is packed into a FIXED-size frame, so the extractor always knows how many
-bits to look for and needs no --payload-length option.
+bits to look for and needs no --payload-length option. Photos (pixel_chain.py)
+and videos (mp4_chain.py) carry exactly the same frame.
 
-Frame layout (176 bytes = 1408 bits, all integers big-endian)
--------------------------------------------------------------
+Frame layout (2016 bytes = 16128 bits, all integers big-endian)
+---------------------------------------------------------------
     offset  size  field
     0       2     magic  b"IC"  ("IMEI Chain")
-    2       1     version (1)
+    2       1     version (2; version 1 was the old 8-hop format)
     3       1     hop count N (0..MAX_HOPS)
-    4       8     image ID: random, set once by the first device, never
-                  changed. The dashboard groups copies of the same original
-                  photo by this ID to build the forwarding tree.
-    12      160   MAX_HOPS hop slots of 20 bytes; slots >= N are all zero:
+    4       8     image ID: set once by the first device, never changed.
+                  The dashboard groups copies of the same original photo
+                  by this ID to build the forwarding tree.
+    12      2000  MAX_HOPS = 100 hop slots of 20 bytes; slots >= N are zero:
                     8  device ID (e.g. the Android ANDROID_ID, 64 bits)
                     7  IMEI as an integer (15 digits < 2^50), 0 = unknown
                     4  Unix timestamp in seconds
                     1  role: 1 = SEND (added when forwarding),
                              2 = CLAIM (added by the final receiver)
-    172     4     CRC-32 of bytes 0..171
+    2012    4     CRC-32 of bytes 0..2011
 
 The magic and the CRC together tell the extractor that it found a real chain
 at the right grid alignment, not random LSB noise.
@@ -35,8 +36,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 MAGIC = b"IC"
-VERSION = 1
-MAX_HOPS = 8
+VERSION = 2
+MAX_HOPS = 100
 
 DEVICE_ID_BYTES = 8
 IMEI_BYTES = 7
@@ -50,8 +51,8 @@ _HOP_STRUCT = struct.Struct(">8s7sIB")          # device, imei, timestamp, role
 _HEADER_STRUCT = struct.Struct(">2sBB8s")       # magic, version, count, image id
 HOP_BYTES = _HOP_STRUCT.size                    # 20
 CRC_BYTES = 4
-FRAME_BYTES = _HEADER_STRUCT.size + MAX_HOPS * HOP_BYTES + CRC_BYTES   # 176
-FRAME_BITS = FRAME_BYTES * 8                                           # 1408
+FRAME_BYTES = _HEADER_STRUCT.size + MAX_HOPS * HOP_BYTES + CRC_BYTES   # 2016
+FRAME_BITS = FRAME_BYTES * 8                                           # 16128
 
 
 class ChainError(ValueError):
